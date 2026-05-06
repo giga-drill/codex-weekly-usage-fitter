@@ -12,7 +12,8 @@ class CliTests(unittest.TestCase):
             command = _default_hook_command()
 
         self.assertIn("PYTHONPATH=", command)
-        self.assertIn("PYTHONPATH='/Users/mac/projs/codex usage/src'", command)
+        self.assertIn("codex usage/src", command)
+        self.assertIn("PYTHONPATH='", command)
 
     def test_toml_string_escapes_double_quotes(self) -> None:
         self.assertEqual(_toml_string('a "quoted" path'), 'a \\"quoted\\" path')

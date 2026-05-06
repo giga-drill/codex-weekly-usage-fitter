@@ -3,7 +3,9 @@ set -u
 
 MODE="${1:-ensure-daemon}"
 LABEL="gui/$(id -u)/local.codex-usage"
-PYTHONPATH_VALUE="/Users/mac/projs/codex usage/src"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHONPATH_VALUE="$REPO_DIR/src"
 LOG_DIR="$HOME/.codex/usage-monitor"
 LOG_FILE="$LOG_DIR/hook.log"
 
