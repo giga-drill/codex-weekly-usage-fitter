@@ -53,20 +53,34 @@ open "build/Codex Usage.app"
 
 The widget reads `~/.codex/usage-monitor/usage.sqlite` every two seconds and
 shows the latest weekly usage percentage, most recent turn token count, model,
-and sample time. It also adds a small menu bar item with the current percentage.
+reasoning effort, and sample time. It also adds a small menu bar item with the
+current percentage.
 
 ## Data Model
 
 The SQLite database contains:
 
-- `sessions`: latest seen total tokens per local Codex session.
-- `samples`: per-turn hook samples, including token delta and weekly usage.
+- `sessions`: latest seen total tokens, model, and reasoning effort per local
+  Codex session.
+- `samples`: per-turn hook samples, including token delta, model, reasoning
+  effort, and weekly usage.
 - `epochs`: weekly reset buckets.
 - `fits`: current token-per-weekly-percent estimate per epoch.
+- `model_effort_fits`: token-per-weekly-percent and turn-per-weekly-percent
+  estimates grouped by model and reasoning effort.
 
 The first observed sample for a session is treated as a baseline and records
 `token_delta = 0`, so enabling the tool in the middle of a long session does not
 over-count previous work.
+
+Stop events without a `transcript_path` are ignored because they cannot be tied
+to a normal local Codex transcript or token sample.
+
+Grouped fits attribute each visible weekly usage percentage increase to the
+model and reasoning-effort groups that consumed tokens since the previous
+increase. If multiple groups contributed before the percentage moved, the
+percentage delta is split by token share. The same attributed percentage delta
+is used to estimate average turns per 1% usage for each group.
 
 ## Boundaries
 

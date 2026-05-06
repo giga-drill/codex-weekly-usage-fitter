@@ -4,11 +4,12 @@ import SQLite3
 
 private struct UsageSnapshot {
     var weeklyPercent: Double?
-    var previousWeeklyPercent: Double?
-    var turnUsagePercent: Double?
     var turnTokens: Int64?
     var latestSampleAt: String?
     var model: String?
+    var reasoningEffort: String?
+    var fitTurnsPerPercent: Double?
+    var fitTokensPerPercent: Double?
     var parseError: String?
     var todayUsagePercent: Double?
     var todayUsageLevel: String
@@ -21,6 +22,8 @@ private struct SampleRow {
     var turnTokens: Int64?
     var latestSampleAt: String?
     var model: String?
+    var reasoningEffort: String?
+    var weeklyResetsAt: Int64?
     var parseError: String?
 }
 
@@ -36,11 +39,12 @@ private final class UsageReader {
         guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             return UsageSnapshot(
                 weeklyPercent: nil,
-                previousWeeklyPercent: nil,
-                turnUsagePercent: nil,
                 turnTokens: nil,
                 latestSampleAt: "database unavailable",
                 model: nil,
+                reasoningEffort: nil,
+                fitTurnsPerPercent: nil,
+                fitTokensPerPercent: nil,
                 parseError: sqliteMessage(db),
                 todayUsagePercent: nil,
                 todayUsageLevel: "low",
@@ -54,16 +58,16 @@ private final class UsageReader {
         let sessionCount = intScalar(db, "SELECT COUNT(*) FROM sessions")
         let rows = latestSamples(db)
         let latest = rows.first
-        let previous = rows.dropFirst().first
-        let turnUsagePercent = usageDelta(from: previous?.weeklyPercent, to: latest?.weeklyPercent)
         let today = todayUsage(db)
+        let fit = modelEffortFit(db, latest: latest)
         return UsageSnapshot(
             weeklyPercent: latest?.weeklyPercent,
-            previousWeeklyPercent: previous?.weeklyPercent,
-            turnUsagePercent: turnUsagePercent,
             turnTokens: latest?.turnTokens,
             latestSampleAt: latest?.latestSampleAt,
             model: latest?.model,
+            reasoningEffort: latest?.reasoningEffort,
+            fitTurnsPerPercent: fit.turns,
+            fitTokensPerPercent: fit.tokens,
             parseError: latest?.parseError,
             todayUsagePercent: today.percent,
             todayUsageLevel: today.level,
@@ -73,23 +77,59 @@ private final class UsageReader {
     }
 
     private func latestSamples(_ db: OpaquePointer?) -> [SampleRow] {
-        let sql = """
-        SELECT weekly_used_percent, last_total_tokens, observed_at, model, parse_error
+        let effortColumn = hasColumn(db, table: "samples", column: "reasoning_effort")
+            ? "reasoning_effort"
+            : "NULL AS reasoning_effort"
+        let usableSql = """
+        SELECT weekly_used_percent, last_total_tokens, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
+        FROM samples
+        WHERE parse_error IS NULL
+          AND weekly_used_percent IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """
+        let fallbackSql = """
+        SELECT weekly_used_percent, last_total_tokens, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
         FROM samples
         ORDER BY id DESC
-        LIMIT 2
+        LIMIT 1
         """
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+        guard let rows = sampleRows(db, sql: usableSql) else {
             return [
                 SampleRow(
                     weeklyPercent: nil,
                     turnTokens: nil,
                     latestSampleAt: nil,
                     model: nil,
+                    reasoningEffort: nil,
+                    weeklyResetsAt: nil,
                     parseError: sqliteMessage(db)
                 )
             ]
+        }
+        if !rows.isEmpty {
+            return rows
+        }
+        if let fallbackRows = sampleRows(db, sql: fallbackSql) {
+            return fallbackRows
+        }
+        return [
+            SampleRow(
+                weeklyPercent: nil,
+                turnTokens: nil,
+                latestSampleAt: nil,
+                model: nil,
+                reasoningEffort: nil,
+                weeklyResetsAt: nil,
+                parseError: sqliteMessage(db)
+            )
+        ]
+    }
+
+    private func sampleRows(_ db: OpaquePointer?, sql: String) -> [SampleRow]? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return nil
         }
         defer { sqlite3_finalize(statement) }
 
@@ -101,16 +141,13 @@ private final class UsageReader {
                     turnTokens: intColumn(statement, 1),
                     latestSampleAt: stringColumn(statement, 2),
                     model: stringColumn(statement, 3),
-                    parseError: stringColumn(statement, 4)
+                    reasoningEffort: stringColumn(statement, 4),
+                    weeklyResetsAt: intColumn(statement, 5),
+                    parseError: stringColumn(statement, 6)
                 )
             )
         }
         return rows
-    }
-
-    private func usageDelta(from previous: Double?, to current: Double?) -> Double? {
-        guard let current, let previous else { return nil }
-        return max(0, current - previous)
     }
 
     private func todayUsage(_ db: OpaquePointer?) -> (percent: Double?, level: String) {
@@ -121,6 +158,7 @@ private final class UsageReader {
         WHERE observed_at >= ?
           AND observed_at < ?
           AND weekly_used_percent IS NOT NULL
+          AND parse_error IS NULL
         ORDER BY observed_at, id
         """
         var statement: OpaquePointer?
@@ -149,6 +187,38 @@ private final class UsageReader {
         return (percent, todayUsageLevel(percent))
     }
 
+    private func modelEffortFit(_ db: OpaquePointer?, latest: SampleRow?) -> (turns: Double?, tokens: Double?) {
+        guard let latest,
+              let weeklyResetsAt = latest.weeklyResetsAt,
+              hasColumn(db, table: "model_effort_fits", column: "turns_per_weekly_percent") else {
+            return (nil, nil)
+        }
+        let model = latest.model ?? "unknown"
+        let effort = normalizedEffort(latest.reasoningEffort) ?? "unknown"
+        let sql = """
+        SELECT turns_per_weekly_percent, tokens_per_weekly_percent
+        FROM model_effort_fits
+        WHERE weekly_resets_at = ?
+          AND model = ?
+          AND reasoning_effort = ?
+        LIMIT 1
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return (nil, nil)
+        }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, weeklyResetsAt)
+        bindText(statement, index: 2, value: model)
+        bindText(statement, index: 3, value: effort)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return (nil, nil)
+        }
+        return (doubleColumn(statement, 0), doubleColumn(statement, 1))
+    }
+
     private func intScalar(_ db: OpaquePointer?, _ sql: String) -> Int64 {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -159,6 +229,21 @@ private final class UsageReader {
             return 0
         }
         return sqlite3_column_int64(statement, 0)
+    }
+
+    private func hasColumn(_ db: OpaquePointer?, table: String, column: String) -> Bool {
+        let sql = "PRAGMA table_info(\(table))"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if stringColumn(statement, 1) == column {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -174,15 +259,17 @@ private final class DragLabel: NSTextField {
     }
 }
 
-private final class UsageWindowController: NSObject {
+private final class UsageWindowController: NSObject, NSWindowDelegate {
     private let reader: UsageReader
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let window: NSPanel
-    private let expandedSize = NSSize(width: 200, height: 146)
+    private let expandedSize = NSSize(width: 243, height: 146)
+    private let expandedContentWidth: CGFloat = 215
     private let compactSize = NSSize(width: 124, height: 118)
     private let titleLabel = DragLabel(labelWithString: "This week")
     private let weeklyLabel = DragLabel(labelWithString: "--%")
-    private let transitionLabel = DragLabel(labelWithString: "Prev -- -> Now --")
+    private let detailPill = DragView()
+    private let transitionLabel = DragLabel(labelWithString: "1% ~= -- turns / -- tok")
     private let turnLabel = DragLabel(labelWithString: "Last turn -- tokens")
     private let metaLabel = DragLabel(labelWithString: "")
     private let todayBadge = DragView()
@@ -196,6 +283,8 @@ private final class UsageWindowController: NSObject {
     private var compactToggleConstraints: [NSLayoutConstraint] = []
     private var expandedLayoutConstraints: [NSLayoutConstraint] = []
     private var compactLayoutConstraints: [NSLayoutConstraint] = []
+    private var targetFrame: NSRect?
+    private var trustTargetFrameUntil = Date.distantPast
 
     init(reader: UsageReader) {
         self.reader = reader
@@ -228,6 +317,7 @@ private final class UsageWindowController: NSObject {
         window.ignoresMouseEvents = false
         window.isMovableByWindowBackground = true
         window.hasShadow = true
+        window.delegate = self
         positionWindow()
     }
 
@@ -258,10 +348,16 @@ private final class UsageWindowController: NSObject {
         weeklyLabel.textColor = .white
         transitionLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         transitionLabel.textColor = NSColor.white.withAlphaComponent(0.86)
+        transitionLabel.translatesAutoresizingMaskIntoConstraints = false
+        transitionLabel.lineBreakMode = .byClipping
         turnLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         turnLabel.textColor = NSColor.white.withAlphaComponent(0.86)
-        metaLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        metaLabel.textColor = NSColor.white.withAlphaComponent(0.68)
+        turnLabel.lineBreakMode = .byClipping
+        metaLabel.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .bold)
+        metaLabel.textColor = NSColor.white.withAlphaComponent(0.9)
+        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+        metaLabel.lineBreakMode = .byClipping
+        configurePill(detailPill, alpha: 0.15)
         todayCaptionLabel.font = NSFont.systemFont(ofSize: 9, weight: .semibold)
         todayCaptionLabel.alignment = .center
         todayLevelLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
@@ -285,11 +381,17 @@ private final class UsageWindowController: NSObject {
         toggleButton.target = self
         toggleButton.action = #selector(toggleCompact)
 
-        let stack = NSStackView(views: [titleLabel, weeklyLabel, transitionLabel, turnLabel, metaLabel])
+        let detailStack = NSStackView(views: [transitionLabel, metaLabel])
+        detailStack.translatesAutoresizingMaskIntoConstraints = false
+        detailStack.orientation = .vertical
+        detailStack.alignment = .leading
+        detailStack.spacing = 2
+        detailPill.addSubview(detailStack)
+        let stack = NSStackView(views: [titleLabel, weeklyLabel, detailPill, turnLabel])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 6
+        stack.spacing = 4
         let todayStack = NSStackView(views: [todayCaptionLabel, todayLevelLabel, todayValueLabel])
         todayStack.translatesAutoresizingMaskIntoConstraints = false
         todayStack.orientation = .vertical
@@ -312,8 +414,11 @@ private final class UsageWindowController: NSObject {
         ]
         expandedLayoutConstraints = [
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            stack.widthAnchor.constraint(equalToConstant: expandedContentWidth),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
-            stack.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            stack.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: 2),
+            detailPill.widthAnchor.constraint(equalToConstant: expandedContentWidth),
+            turnLabel.widthAnchor.constraint(equalToConstant: expandedContentWidth),
             todayBadge.trailingAnchor.constraint(equalTo: toggleButton.leadingAnchor, constant: -1),
             todayBadge.topAnchor.constraint(equalTo: root.topAnchor, constant: 19),
             todayBadge.widthAnchor.constraint(equalToConstant: 70),
@@ -335,6 +440,10 @@ private final class UsageWindowController: NSObject {
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
             todayStack.centerXAnchor.constraint(equalTo: todayBadge.centerXAnchor),
             todayStack.centerYAnchor.constraint(equalTo: todayBadge.centerYAnchor),
+            detailPill.heightAnchor.constraint(equalToConstant: 42),
+            detailStack.leadingAnchor.constraint(equalTo: detailPill.leadingAnchor, constant: 7),
+            detailStack.trailingAnchor.constraint(equalTo: detailPill.trailingAnchor, constant: -7),
+            detailStack.centerYAnchor.constraint(equalTo: detailPill.centerYAnchor),
             toggleButton.widthAnchor.constraint(equalToConstant: 18),
             toggleButton.heightAnchor.constraint(equalToConstant: 18)
         ])
@@ -355,18 +464,20 @@ private final class UsageWindowController: NSObject {
             transitionLabel.stringValue = "Parse issue"
             turnLabel.stringValue = error
         } else if snapshot.sampleCount == 0 {
-            transitionLabel.stringValue = "Prev -- -> Now --"
+            transitionLabel.stringValue = "1% ~= -- turns / -- tok"
             turnLabel.stringValue = "Waiting for first sample"
         } else {
-            let previous = snapshot.previousWeeklyPercent.map { formatPercent($0) } ?? "--%"
-            transitionLabel.stringValue = "Prev \(previous) -> Now \(percentText)"
+            transitionLabel.stringValue = formatFitLine(
+                turns: snapshot.fitTurnsPerPercent,
+                tokens: snapshot.fitTokensPerPercent
+            )
             let turnTokens = formatTokens(snapshot.turnTokens)
             turnLabel.stringValue = "Last turn \(turnTokens) tokens"
         }
 
-        let model = snapshot.model ?? "unknown"
+        let model = modelDisplayName(snapshot.model, effort: snapshot.reasoningEffort)
         let time = shortTime(snapshot.latestSampleAt)
-        metaLabel.stringValue = "\(model)  \(time)"
+        metaLabel.attributedStringValue = metaLine(model: model, time: time)
     }
 
     @objc private func toggleCompact() {
@@ -376,9 +487,8 @@ private final class UsageWindowController: NSObject {
 
     private func applyViewMode(animated: Bool) {
         titleLabel.isHidden = isCompact
-        transitionLabel.isHidden = isCompact
+        detailPill.isHidden = isCompact
         turnLabel.isHidden = isCompact
-        metaLabel.isHidden = isCompact
         todayCaptionLabel.isHidden = isCompact
         todayValueLabel.isHidden = false
         weeklyLabel.font = NSFont.monospacedDigitSystemFont(
@@ -395,15 +505,29 @@ private final class UsageWindowController: NSObject {
     }
 
     private func resizeWindow(to size: NSSize, animated: Bool) {
-        var frame = window.frame
-        frame.origin.x = frame.maxX - size.width
+        let sourceFrame = resizeSourceFrame()
+        var frame = sourceFrame
+        let rightEdge = sourceFrame.maxX
         frame.origin.y = frame.maxY - size.height
+        frame.origin.x = rightEdge - size.width
         frame.size = size
-        if animated {
-            window.animator().setFrame(frame, display: true)
-        } else {
-            window.setFrame(frame, display: true)
+        targetFrame = frame
+        trustTargetFrameUntil = animated ? Date().addingTimeInterval(0.35) : .distantPast
+        window.setFrame(frame, display: true, animate: animated)
+    }
+
+    private func resizeSourceFrame() -> NSRect {
+        if Date() < trustTargetFrameUntil, let targetFrame {
+            return targetFrame
         }
+        return window.frame
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard Date() >= trustTargetFrameUntil else {
+            return
+        }
+        targetFrame = window.frame
     }
 
     private func applyTodayStyle(level: String) {
@@ -414,11 +538,22 @@ private final class UsageWindowController: NSObject {
         todayValueLabel.textColor = style.text.withAlphaComponent(0.86)
     }
 
+    private func configurePill(_ view: DragView, alpha: CGFloat) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(alpha).cgColor
+        view.layer?.cornerRadius = 7
+        view.layer?.masksToBounds = true
+        view.layer?.borderWidth = 0.5
+        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+    }
+
     private func positionWindow() {
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
         let size = window.frame.size
         window.setFrameOrigin(NSPoint(x: frame.maxX - size.width - 20, y: frame.maxY - size.height - 20))
+        targetFrame = window.frame
     }
 
     @objc private func showWindow() {
@@ -492,14 +627,88 @@ private func formatSignedPercent(_ value: Double) -> String {
 
 private func formatTokens(_ value: Int64?) -> String {
     guard let value else { return "--" }
+    return formatTokenCount(Double(value))
+}
+
+private func formatTokenCount(_ value: Double) -> String {
     let absValue = abs(Double(value))
     if absValue >= 1_000_000 {
-        return String(format: "%.1fM", Double(value) / 1_000_000)
+        return String(format: "%.1fM", value / 1_000_000)
     }
     if absValue >= 1_000 {
-        return String(format: "%.1fk", Double(value) / 1_000)
+        return String(format: "%.1fk", value / 1_000)
     }
-    return "\(value)"
+    return String(format: "%.0f", value)
+}
+
+private func formatFitLine(turns: Double?, tokens: Double?) -> String {
+    guard let turns, let tokens else {
+        return "1% ~= -- turns / -- tok"
+    }
+    return "1% ~= \(formatTurns(turns)) turns / \(formatTokenCount(tokens)) tok"
+}
+
+private func formatTurns(_ value: Double) -> String {
+    if value >= 10 {
+        return String(format: "%.0f", value)
+    }
+    return String(format: "%.1f", value)
+}
+
+private func modelDisplayName(_ model: String?, effort: String?) -> String {
+    let modelName = model ?? "unknown"
+    guard let effortLabel = effortDisplayName(effort) else {
+        return modelName
+    }
+    return "\(modelName) (\(effortLabel))"
+}
+
+private func metaLine(model: String, time: String) -> NSAttributedString {
+    let output = NSMutableAttributedString(
+        string: model,
+        attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 12.5, weight: .bold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.9),
+        ]
+    )
+    output.append(
+        NSAttributedString(
+            string: "  \(time)",
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.55),
+            ]
+        )
+    )
+    return output
+}
+
+private func effortDisplayName(_ effort: String?) -> String? {
+    guard let normalized = normalizedEffort(effort) else { return nil }
+    switch normalized {
+    case "xhigh":
+        return "x high"
+    default:
+        return normalized
+    }
+}
+
+private func normalizedEffort(_ effort: String?) -> String? {
+    guard let effort else { return nil }
+    let normalized = effort
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .replacingOccurrences(of: "-", with: " ")
+        .replacingOccurrences(of: "_", with: " ")
+    let compact = normalized.replacingOccurrences(of: " ", with: "")
+    switch compact {
+    case "":
+        return nil
+    case "xhigh", "extrahigh":
+        return "xhigh"
+    default:
+        return normalized
+    }
 }
 
 private func todayBounds() -> (start: String, end: String) {

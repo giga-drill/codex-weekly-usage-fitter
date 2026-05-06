@@ -40,10 +40,14 @@ class UsageCollector:
             time.sleep(self.delay_seconds)
 
         transcript_path = event.get("transcript_path")
-        if transcript_path:
-            snapshot = parse_transcript(str(transcript_path))
-        else:
-            snapshot = TranscriptSnapshot(path="", error="missing transcript_path")
+        if not transcript_path:
+            return False
+
+        turn_id = event.get("turn_id")
+        snapshot = parse_transcript(
+            str(transcript_path),
+            turn_id=str(turn_id) if turn_id is not None else None,
+        )
 
         fallback_weekly = None
         if snapshot.weekly_limit is None and self.use_app_server:
@@ -153,6 +157,9 @@ def _normalize_event(event: dict[str, Any]) -> dict[str, Any]:
         "turn_id": event.get("turn_id"),
         "transcript_path": event.get("transcript_path"),
         "model": event.get("model"),
+        "reasoning_effort": event.get("reasoning_effort")
+        or event.get("reasoningEffort")
+        or event.get("effort"),
         "cwd": event.get("cwd"),
         "received_at": utc_now_iso(),
     }

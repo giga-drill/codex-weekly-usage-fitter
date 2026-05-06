@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .paths import db_path, ensure_usage_dirs
-from .transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit
+from .transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit, parse_transcript
 
 
 EXTERNAL_TOKEN_THRESHOLD = 1000
@@ -42,7 +42,8 @@ class UsageStore:
                 last_total_tokens INTEGER,
                 last_seen_at TEXT NOT NULL,
                 transcript_path TEXT,
-                model TEXT
+                model TEXT,
+                reasoning_effort TEXT
             );
 
             CREATE TABLE IF NOT EXISTS samples (
@@ -53,6 +54,7 @@ class UsageStore:
                 session_id TEXT,
                 turn_id TEXT,
                 model TEXT,
+                reasoning_effort TEXT,
                 transcript_path TEXT,
                 token_delta INTEGER NOT NULL DEFAULT 0,
                 token_total INTEGER,
@@ -94,9 +96,86 @@ class UsageStore:
                 external_usage_observed INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS model_effort_fits (
+                weekly_resets_at INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                reasoning_effort TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                token_delta_total INTEGER NOT NULL,
+                percent_delta REAL NOT NULL,
+                tokens_per_weekly_percent REAL,
+                turns_per_weekly_percent REAL,
+                confidence TEXT NOT NULL,
+                external_usage_observed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (weekly_resets_at, model, reasoning_effort)
+            );
             """
         )
+        self._ensure_column("sessions", "reasoning_effort", "TEXT")
+        self._ensure_column("samples", "reasoning_effort", "TEXT")
+        self._backfill_model_effort()
+        self._ensure_column("model_effort_fits", "turns_per_weekly_percent", "REAL")
+        self._ensure_model_effort_fits()
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _backfill_model_effort(self) -> None:
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT id, transcript_path, turn_id, model, reasoning_effort
+                FROM samples
+                WHERE transcript_path IS NOT NULL
+                  AND turn_id IS NOT NULL
+                  AND (model IS NULL OR reasoning_effort IS NULL)
+                """
+            )
+        )
+        for row in rows:
+            snapshot = parse_transcript(row["transcript_path"], turn_id=row["turn_id"])
+            model = row["model"] or snapshot.model
+            reasoning_effort = row["reasoning_effort"] or _normalize_effort(
+                snapshot.reasoning_effort
+            )
+            if model == row["model"] and reasoning_effort == row["reasoning_effort"]:
+                continue
+            self.conn.execute(
+                """
+                UPDATE samples
+                SET model = ?, reasoning_effort = ?
+                WHERE id = ?
+                """,
+                (model, reasoning_effort, row["id"]),
+            )
+
+    def _ensure_model_effort_fits(self) -> None:
+        sample_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM samples"
+        ).fetchone()["value"]
+        if sample_count == 0:
+            return
+        fit_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM model_effort_fits"
+        ).fetchone()["value"]
+        missing_turn_fit_count = self.conn.execute(
+            """
+            SELECT COUNT(*) AS value
+            FROM model_effort_fits
+            WHERE percent_delta > 0
+              AND turns_per_weekly_percent IS NULL
+            """
+        ).fetchone()["value"]
+        if fit_count == 0 or missing_turn_fit_count:
+            self.rebuild_epochs_and_fits()
 
     def record_sample(
         self,
@@ -107,7 +186,13 @@ class UsageStore:
         observed_at = utc_now_iso()
         session_id = _string_or_none(event.get("session_id"))
         turn_id = _string_or_none(event.get("turn_id"))
-        model = _string_or_none(event.get("model"))
+        model = _string_or_none(event.get("model")) or snapshot.model
+        reasoning_effort = _normalize_effort(
+            event.get("reasoning_effort")
+            or event.get("reasoningEffort")
+            or event.get("effort")
+            or snapshot.reasoning_effort
+        )
         transcript_path = _string_or_none(event.get("transcript_path")) or snapshot.path
         hook_received_at = _string_or_none(event.get("received_at"))
 
@@ -132,6 +217,7 @@ class UsageStore:
             "session_id": session_id,
             "turn_id": turn_id,
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "transcript_path": transcript_path,
             "token_delta": token_delta,
             "token_total": token_total,
@@ -161,7 +247,7 @@ class UsageStore:
                 """
                 INSERT OR IGNORE INTO samples (
                     event_id, observed_at, hook_received_at, session_id, turn_id, model,
-                    transcript_path, token_delta, token_total, input_tokens,
+                    reasoning_effort, transcript_path, token_delta, token_total, input_tokens,
                     cached_input_tokens, output_tokens, reasoning_output_tokens,
                     last_total_tokens, last_input_tokens, last_cached_input_tokens,
                     last_output_tokens, last_reasoning_output_tokens,
@@ -170,7 +256,7 @@ class UsageStore:
                 )
                 VALUES (
                     :event_id, :observed_at, :hook_received_at, :session_id, :turn_id,
-                    :model, :transcript_path, :token_delta, :token_total, :input_tokens,
+                    :model, :reasoning_effort, :transcript_path, :token_delta, :token_total, :input_tokens,
                     :cached_input_tokens, :output_tokens, :reasoning_output_tokens,
                     :last_total_tokens, :last_input_tokens, :last_cached_input_tokens,
                     :last_output_tokens, :last_reasoning_output_tokens,
@@ -188,6 +274,7 @@ class UsageStore:
                     last_seen_at=observed_at,
                     transcript_path=transcript_path,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                 )
 
         if inserted:
@@ -212,20 +299,30 @@ class UsageStore:
         last_seen_at: str,
         transcript_path: str | None,
         model: str | None,
+        reasoning_effort: str | None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO sessions (
-                session_id, last_total_tokens, last_seen_at, transcript_path, model
+                session_id, last_total_tokens, last_seen_at, transcript_path, model,
+                reasoning_effort
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 last_total_tokens = COALESCE(excluded.last_total_tokens, sessions.last_total_tokens),
                 last_seen_at = excluded.last_seen_at,
                 transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
-                model = COALESCE(excluded.model, sessions.model)
+                model = COALESCE(excluded.model, sessions.model),
+                reasoning_effort = COALESCE(excluded.reasoning_effort, sessions.reasoning_effort)
             """,
-            (session_id, last_total_tokens, last_seen_at, transcript_path, model),
+            (
+                session_id,
+                last_total_tokens,
+                last_seen_at,
+                transcript_path,
+                model,
+                reasoning_effort,
+            ),
         )
 
     def _compute_delta(self, previous: int | None, current: int | None) -> int:
@@ -258,6 +355,7 @@ class UsageStore:
         with self.conn:
             self.conn.execute("DELETE FROM epochs")
             self.conn.execute("DELETE FROM fits")
+            self.conn.execute("DELETE FROM model_effort_fits")
             resets = [
                 row["weekly_resets_at"]
                 for row in self.conn.execute(
@@ -273,7 +371,9 @@ class UsageStore:
                 rows = list(
                     self.conn.execute(
                         """
-                        SELECT id, observed_at, token_delta, weekly_used_percent
+                        SELECT
+                            id, observed_at, token_delta, weekly_used_percent,
+                            model, reasoning_effort
                         FROM samples
                         WHERE weekly_resets_at = ?
                           AND weekly_used_percent IS NOT NULL
@@ -347,13 +447,52 @@ class UsageStore:
                     """,
                     (int(external), reset_at),
                 )
+                for group in _model_effort_fit_rows(rows):
+                    self.conn.execute(
+                        """
+                        INSERT INTO model_effort_fits (
+                            weekly_resets_at, model, reasoning_effort,
+                            sample_count, token_delta_total, percent_delta,
+                            tokens_per_weekly_percent, turns_per_weekly_percent,
+                            confidence,
+                            external_usage_observed, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            reset_at,
+                            group["model"],
+                            group["reasoning_effort"],
+                            group["sample_count"],
+                            group["token_delta_total"],
+                            group["percent_delta"],
+                            group["tokens_per_weekly_percent"],
+                            group["turns_per_weekly_percent"],
+                            group["confidence"],
+                            int(group["external_usage_observed"]),
+                            utc_now_iso(),
+                        ),
+                    )
 
     def status(self) -> dict[str, Any]:
         latest = self.conn.execute(
-            "SELECT * FROM samples ORDER BY observed_at DESC, id DESC LIMIT 1"
+            """
+            SELECT *
+            FROM samples
+            WHERE parse_error IS NULL
+              AND weekly_used_percent IS NOT NULL
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """
         ).fetchone()
+        if latest is None:
+            latest = self.conn.execute(
+                "SELECT * FROM samples ORDER BY observed_at DESC, id DESC LIMIT 1"
+            ).fetchone()
         latest_epoch = None
         latest_fit = None
+        latest_model_effort_fit = None
+        model_effort_fits: list[sqlite3.Row] = []
         if latest is not None and latest["weekly_resets_at"] is not None:
             latest_epoch = self.conn.execute(
                 "SELECT * FROM epochs WHERE weekly_resets_at = ?",
@@ -363,6 +502,29 @@ class UsageStore:
                 "SELECT * FROM fits WHERE weekly_resets_at = ?",
                 (latest["weekly_resets_at"],),
             ).fetchone()
+            latest_key = _model_effort_key(latest)
+            latest_model_effort_fit = self.conn.execute(
+                """
+                SELECT *
+                FROM model_effort_fits
+                WHERE weekly_resets_at = ?
+                  AND model = ?
+                  AND reasoning_effort = ?
+                """,
+                (latest["weekly_resets_at"], latest_key[0], latest_key[1]),
+            ).fetchone()
+            model_effort_fits = list(
+                self.conn.execute(
+                    """
+                    SELECT *
+                    FROM model_effort_fits
+                    WHERE weekly_resets_at = ?
+                    ORDER BY percent_delta DESC, token_delta_total DESC
+                    LIMIT 5
+                    """,
+                    (latest["weekly_resets_at"],),
+                )
+            )
 
         total_observed = self.conn.execute(
             "SELECT COALESCE(SUM(token_delta), 0) AS value FROM samples"
@@ -392,6 +554,8 @@ class UsageStore:
             "latest_sample": _row_to_dict(latest),
             "latest_epoch": _row_to_dict(latest_epoch),
             "latest_fit": _row_to_dict(latest_fit),
+            "latest_model_effort_fit": _row_to_dict(latest_model_effort_fit),
+            "model_effort_fits": [_row_to_dict(row) for row in model_effort_fits],
             "today_usage": self.today_usage(),
         }
 
@@ -410,6 +574,7 @@ class UsageStore:
                 WHERE observed_at >= ?
                   AND observed_at < ?
                   AND weekly_used_percent IS NOT NULL
+                  AND parse_error IS NULL
                 ORDER BY observed_at, id
                 """,
                 (start_utc, end_utc),
@@ -464,6 +629,25 @@ def _string_or_none(value: Any) -> str | None:
     return text if text else None
 
 
+def _normalize_effort(value: Any) -> str | None:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    normalized = text.strip().lower().replace("-", " ").replace("_", " ")
+    normalized = " ".join(normalized.split())
+    aliases = {
+        "none": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "x high": "xhigh",
+        "xhigh": "xhigh",
+        "extra high": "xhigh",
+    }
+    return aliases.get(normalized, normalized)
+
+
 def _safe_raw(event: dict[str, Any], snapshot: TranscriptSnapshot) -> dict[str, Any]:
     return {
         "event": {
@@ -471,11 +655,16 @@ def _safe_raw(event: dict[str, Any], snapshot: TranscriptSnapshot) -> dict[str, 
             "turn_id": event.get("turn_id"),
             "transcript_path": event.get("transcript_path"),
             "model": event.get("model"),
+            "reasoning_effort": event.get("reasoning_effort")
+            or event.get("reasoningEffort")
+            or event.get("effort"),
             "received_at": event.get("received_at"),
         },
         "snapshot": {
             "path": snapshot.path,
             "token_event_timestamp": snapshot.token_event_timestamp,
+            "model": snapshot.model,
+            "reasoning_effort": snapshot.reasoning_effort,
             "total_usage": asdict(snapshot.total_usage)
             if snapshot.total_usage is not None
             else None,
@@ -489,6 +678,79 @@ def _safe_raw(event: dict[str, Any], snapshot: TranscriptSnapshot) -> dict[str, 
             "error": snapshot.error,
         },
     }
+
+
+def _model_effort_fit_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    if len(rows) < 2:
+        return []
+
+    stats: dict[tuple[str, str], dict[str, Any]] = {}
+    pending_tokens: dict[tuple[str, str], int] = {}
+    pending_samples: dict[tuple[str, str], int] = {}
+    previous_percent = float(rows[0]["weekly_used_percent"])
+
+    def ensure(key: tuple[str, str]) -> dict[str, Any]:
+        if key not in stats:
+            stats[key] = {
+                "model": key[0],
+                "reasoning_effort": key[1],
+                "sample_count": 0,
+                "token_delta_total": 0,
+                "percent_delta": 0.0,
+                "external_usage_observed": False,
+            }
+        return stats[key]
+
+    for row in rows[1:]:
+        key = _model_effort_key(row)
+        token_delta = int(row["token_delta"] or 0)
+        if token_delta > 0:
+            pending_tokens[key] = pending_tokens.get(key, 0) + token_delta
+            pending_samples[key] = pending_samples.get(key, 0) + 1
+
+        current_percent = float(row["weekly_used_percent"])
+        movement = max(0.0, current_percent - previous_percent)
+        if movement > 0:
+            total_pending = sum(pending_tokens.values())
+            if total_pending <= EXTERNAL_TOKEN_THRESHOLD:
+                for pending_key, tokens in pending_tokens.items():
+                    stat = ensure(pending_key)
+                    stat["sample_count"] += pending_samples.get(pending_key, 0)
+                    stat["token_delta_total"] += tokens
+                    stat["external_usage_observed"] = True
+            else:
+                for pending_key, tokens in pending_tokens.items():
+                    stat = ensure(pending_key)
+                    stat["sample_count"] += pending_samples.get(pending_key, 0)
+                    stat["token_delta_total"] += tokens
+                    stat["percent_delta"] += movement * tokens / total_pending
+            pending_tokens.clear()
+            pending_samples.clear()
+        previous_percent = current_percent
+
+    output = []
+    for stat in stats.values():
+        percent_delta = float(stat["percent_delta"])
+        token_total = int(stat["token_delta_total"])
+        stat["tokens_per_weekly_percent"] = (
+            token_total / percent_delta if percent_delta > 0 else None
+        )
+        stat["turns_per_weekly_percent"] = (
+            int(stat["sample_count"]) / percent_delta if percent_delta > 0 else None
+        )
+        stat["confidence"] = _confidence(
+            sample_count=int(stat["sample_count"]),
+            percent_delta=percent_delta,
+            external=bool(stat["external_usage_observed"]),
+        )
+        output.append(stat)
+    return output
+
+
+def _model_effort_key(row: sqlite3.Row) -> tuple[str, str]:
+    model = _string_or_none(row["model"]) or "unknown"
+    effort = _normalize_effort(row["reasoning_effort"]) or "unknown"
+    return model, effort
 
 
 def _external_usage_observed(rows: Iterable[sqlite3.Row]) -> bool:

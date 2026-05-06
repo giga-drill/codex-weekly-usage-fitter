@@ -29,6 +29,8 @@ class TranscriptSnapshot:
     token_event_timestamp: str | None = None
     total_usage: TokenUsage | None = None
     last_usage: TokenUsage | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
     model_context_window: int | None = None
     weekly_limit: WeeklyLimit | None = None
     plan_type: str | None = None
@@ -59,6 +61,12 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value if value else None
 
 
 def _parse_usage(raw: Any) -> TokenUsage | None:
@@ -112,11 +120,27 @@ def _parse_weekly_limit(rate_limits: Any) -> WeeklyLimit | None:
     )
 
 
-def parse_transcript(path: str | Path) -> TranscriptSnapshot:
+def _turn_effort(payload: dict[str, Any]) -> str | None:
+    effort = _as_text(_first(payload, "effort", "reasoning_effort", "reasoningEffort"))
+    if effort is not None:
+        return effort
+    collaboration = payload.get("collaboration_mode")
+    if isinstance(collaboration, dict):
+        settings = collaboration.get("settings")
+        if isinstance(settings, dict):
+            return _as_text(
+                _first(settings, "reasoning_effort", "reasoningEffort", "effort")
+            )
+    return None
+
+
+def parse_transcript(path: str | Path, turn_id: str | None = None) -> TranscriptSnapshot:
     transcript_path = Path(path).expanduser()
     if not transcript_path.exists():
         return TranscriptSnapshot(path=str(transcript_path), error="missing transcript")
 
+    latest_model: str | None = None
+    latest_reasoning_effort: str | None = None
     latest_token_timestamp: str | None = None
     latest_total_usage: TokenUsage | None = None
     latest_last_usage: TokenUsage | None = None
@@ -139,6 +163,17 @@ def parse_transcript(path: str | Path) -> TranscriptSnapshot:
                     continue
 
                 payload = envelope.get("payload")
+                if envelope.get("type") == "turn_context" and isinstance(payload, dict):
+                    payload_turn_id = _first(payload, "turn_id", "turnId")
+                    if turn_id is None or payload_turn_id == turn_id:
+                        model = _as_text(_first(payload, "model"))
+                        effort = _turn_effort(payload)
+                        if model is not None:
+                            latest_model = model
+                        if effort is not None:
+                            latest_reasoning_effort = effort
+                    continue
+
                 if envelope.get("type") != "event_msg" or not isinstance(payload, dict):
                     continue
                 payload_type = _first(payload, "type")
@@ -190,6 +225,8 @@ def parse_transcript(path: str | Path) -> TranscriptSnapshot:
         token_event_timestamp=latest_token_timestamp,
         total_usage=latest_total_usage,
         last_usage=latest_last_usage,
+        model=latest_model,
+        reasoning_effort=latest_reasoning_effort,
         model_context_window=latest_context_window,
         weekly_limit=latest_weekly_limit,
         plan_type=latest_plan_type,

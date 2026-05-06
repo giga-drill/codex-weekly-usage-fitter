@@ -12,6 +12,15 @@ class TranscriptParserTests(unittest.TestCase):
     def test_parses_local_token_count_event_with_weekly_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "session.jsonl"
+            turn = {
+                "timestamp": "2026-05-06T01:02:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-1",
+                    "model": "gpt-test",
+                    "effort": "high",
+                },
+            }
             event = {
                 "timestamp": "2026-05-06T01:02:03Z",
                 "type": "event_msg",
@@ -44,16 +53,55 @@ class TranscriptParserTests(unittest.TestCase):
                     "plan_type": "prolite",
                 },
             }
-            path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            path.write_text(
+                json.dumps(turn) + "\n" + json.dumps(event) + "\n",
+                encoding="utf-8",
+            )
 
-            snapshot = parse_transcript(path)
+            snapshot = parse_transcript(path, turn_id="turn-1")
 
             self.assertIsNone(snapshot.error)
+            self.assertEqual(snapshot.model, "gpt-test")
+            self.assertEqual(snapshot.reasoning_effort, "high")
             self.assertEqual(snapshot.total_usage.total_tokens, 130)
             self.assertEqual(snapshot.last_usage.total_tokens, 13)
             self.assertEqual(snapshot.weekly_limit.used_percent, 23.5)
             self.assertEqual(snapshot.weekly_limit.source, "transcript_raw")
             self.assertEqual(snapshot.weekly_limit.window_minutes, 10080)
+
+    def test_parses_reasoning_effort_from_collaboration_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            turn = {
+                "timestamp": "2026-05-06T01:02:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-2",
+                    "model": "gpt-test",
+                    "collaboration_mode": {
+                        "settings": {"reasoning_effort": "xhigh"}
+                    },
+                },
+            }
+            event = {
+                "timestamp": "2026-05-06T01:02:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"total_tokens": 13},
+                    },
+                },
+            }
+            path.write_text(
+                json.dumps(turn) + "\n" + json.dumps(event) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = parse_transcript(path, turn_id="turn-2")
+
+            self.assertEqual(snapshot.model, "gpt-test")
+            self.assertEqual(snapshot.reasoning_effort, "xhigh")
 
     def test_handles_rate_limit_only_token_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

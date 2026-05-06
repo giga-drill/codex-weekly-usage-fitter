@@ -157,6 +157,8 @@ def _format_status(status: dict[str, Any]) -> str:
     latest = status.get("latest_sample")
     fit = status.get("latest_fit")
     epoch = status.get("latest_epoch")
+    model_effort_fit = status.get("latest_model_effort_fit")
+    model_effort_fits = status.get("model_effort_fits") or []
     lines = ["Codex weekly usage fitter"]
     lines.append(f"Home: {status['home']}")
     lines.append(
@@ -189,6 +191,8 @@ def _format_status(status: dict[str, Any]) -> str:
         "Latest sample: "
         f"session={latest.get('session_id') or '-'} "
         f"turn={latest.get('turn_id') or '-'} "
+        f"model={latest.get('model') or '-'} "
+        f"effort={latest.get('reasoning_effort') or '-'} "
         f"delta={latest.get('token_delta')} "
         f"total={latest.get('token_total')}"
     )
@@ -212,7 +216,31 @@ def _format_status(status: dict[str, Any]) -> str:
     elif epoch:
         lines.append("Fit: waiting for more samples")
 
+    if model_effort_fit:
+        lines.append("Model/effort fit: " + _format_model_effort_fit(model_effort_fit))
+    elif model_effort_fits:
+        lines.append("Model/effort fits:")
+        for group in model_effort_fits[:3]:
+            lines.append("  - " + _format_model_effort_fit(group))
+
     return "\n".join(lines)
+
+
+def _format_model_effort_fit(fit: dict[str, Any]) -> str:
+    label = f"{fit.get('model') or 'unknown'}/{fit.get('reasoning_effort') or 'unknown'}"
+    tpp = fit.get("tokens_per_weekly_percent")
+    if tpp is None:
+        return (
+            f"{label}: waiting for weekly percent movement "
+            f"(confidence {fit['confidence']}, samples {fit['sample_count']})"
+        )
+    turns = fit.get("turns_per_weekly_percent")
+    turn_text = f", turns/1% {turns:.2g}" if turns is not None else ""
+    return (
+        f"{label}: {tpp:.0f} tokens per 1% weekly "
+        f"(confidence {fit['confidence']}, samples {fit['sample_count']}{turn_text}, "
+        f"percent {fit['percent_delta']:.3g})"
+    )
 
 
 def _format_epoch_time(value: Any) -> str:
