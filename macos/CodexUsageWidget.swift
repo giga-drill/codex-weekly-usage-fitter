@@ -178,12 +178,12 @@ private final class UsageWindowController: NSObject {
     private let reader: UsageReader
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let window: NSPanel
-    private let expandedSize = NSSize(width: 300, height: 156)
-    private let compactSize = NSSize(width: 208, height: 72)
+    private let expandedSize = NSSize(width: 200, height: 146)
+    private let compactSize = NSSize(width: 124, height: 118)
     private let titleLabel = DragLabel(labelWithString: "This week")
     private let weeklyLabel = DragLabel(labelWithString: "--%")
     private let transitionLabel = DragLabel(labelWithString: "Prev -- -> Now --")
-    private let turnLabel = DragLabel(labelWithString: "Last turn -- / -- tokens")
+    private let turnLabel = DragLabel(labelWithString: "Last turn -- tokens")
     private let metaLabel = DragLabel(labelWithString: "")
     private let todayBadge = DragView()
     private let todayCaptionLabel = DragLabel(labelWithString: "Today")
@@ -194,6 +194,8 @@ private final class UsageWindowController: NSObject {
     private var isCompact = false
     private var expandedToggleConstraints: [NSLayoutConstraint] = []
     private var compactToggleConstraints: [NSLayoutConstraint] = []
+    private var expandedLayoutConstraints: [NSLayoutConstraint] = []
+    private var compactLayoutConstraints: [NSLayoutConstraint] = []
 
     init(reader: UsageReader) {
         self.reader = reader
@@ -273,12 +275,12 @@ private final class UsageWindowController: NSObject {
         toggleButton.translatesAutoresizingMaskIntoConstraints = false
         toggleButton.wantsLayer = true
         toggleButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
-        toggleButton.layer?.cornerRadius = 11
+        toggleButton.layer?.cornerRadius = 9
         toggleButton.layer?.masksToBounds = true
         toggleButton.layer?.borderWidth = 0.5
         toggleButton.layer?.borderColor = NSColor.black.withAlphaComponent(0.18).cgColor
         toggleButton.isBordered = false
-        toggleButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        toggleButton.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         toggleButton.contentTintColor = .black
         toggleButton.target = self
         toggleButton.action = #selector(toggleCompact)
@@ -308,23 +310,33 @@ private final class UsageWindowController: NSObject {
             toggleButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -10),
             toggleButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 10)
         ]
+        expandedLayoutConstraints = [
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
+            stack.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            todayBadge.trailingAnchor.constraint(equalTo: toggleButton.leadingAnchor, constant: -1),
+            todayBadge.topAnchor.constraint(equalTo: root.topAnchor, constant: 19),
+            todayBadge.widthAnchor.constraint(equalToConstant: 70),
+            todayBadge.heightAnchor.constraint(equalToConstant: 48)
+        ]
+        compactLayoutConstraints = [
+            stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            todayBadge.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            todayBadge.topAnchor.constraint(equalTo: weeklyLabel.bottomAnchor, constant: 10),
+            todayBadge.widthAnchor.constraint(equalToConstant: 74),
+            todayBadge.heightAnchor.constraint(equalToConstant: 46)
+        ]
 
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -16),
-            stack.centerYAnchor.constraint(equalTo: root.centerYAnchor),
-            todayBadge.trailingAnchor.constraint(equalTo: toggleButton.leadingAnchor, constant: -8),
-            todayBadge.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            todayBadge.widthAnchor.constraint(equalToConstant: 82),
-            todayBadge.heightAnchor.constraint(equalToConstant: 48),
             todayStack.centerXAnchor.constraint(equalTo: todayBadge.centerXAnchor),
             todayStack.centerYAnchor.constraint(equalTo: todayBadge.centerYAnchor),
-            toggleButton.widthAnchor.constraint(equalToConstant: 22),
-            toggleButton.heightAnchor.constraint(equalToConstant: 22)
+            toggleButton.widthAnchor.constraint(equalToConstant: 18),
+            toggleButton.heightAnchor.constraint(equalToConstant: 18)
         ])
         applyViewMode(animated: false)
     }
@@ -348,9 +360,8 @@ private final class UsageWindowController: NSObject {
         } else {
             let previous = snapshot.previousWeeklyPercent.map { formatPercent($0) } ?? "--%"
             transitionLabel.stringValue = "Prev \(previous) -> Now \(percentText)"
-            let turnUsage = snapshot.turnUsagePercent.map { formatSignedPercent($0) } ?? "--"
             let turnTokens = formatTokens(snapshot.turnTokens)
-            turnLabel.stringValue = "Last turn \(turnUsage) / \(turnTokens) tokens"
+            turnLabel.stringValue = "Last turn \(turnTokens) tokens"
         }
 
         let model = snapshot.model ?? "unknown"
@@ -375,8 +386,11 @@ private final class UsageWindowController: NSObject {
             weight: .semibold
         )
         toggleButton.title = isCompact ? "+" : "-"
-        NSLayoutConstraint.deactivate(expandedToggleConstraints + compactToggleConstraints)
+        NSLayoutConstraint.deactivate(
+            expandedToggleConstraints + compactToggleConstraints + expandedLayoutConstraints + compactLayoutConstraints
+        )
         NSLayoutConstraint.activate(isCompact ? compactToggleConstraints : expandedToggleConstraints)
+        NSLayoutConstraint.activate(isCompact ? compactLayoutConstraints : expandedLayoutConstraints)
         resizeWindow(to: isCompact ? compactSize : expandedSize, animated: animated)
     }
 
