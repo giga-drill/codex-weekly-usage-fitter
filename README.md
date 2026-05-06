@@ -20,6 +20,7 @@ PYTHONPATH=src python3 -m codex_usage status
 PYTHONPATH=src python3 -m codex_usage daemon
 PYTHONPATH=src python3 -m codex_usage export
 PYTHONPATH=src python3 -m codex_usage hook-config
+scripts/run-widget.sh
 ```
 
 Install as a local CLI:
@@ -40,6 +41,19 @@ codex-usage hook-config
 Add the printed snippet to `~/.codex/config.toml`. The hook command is designed
 to return quickly. If the daemon is not online, it writes a small spool file to
 `~/.codex/usage-monitor/spool/`.
+
+## macOS Usage Widget
+
+Build and run the small native floating widget:
+
+```bash
+scripts/package-widget-app.sh
+open "build/Codex Usage.app"
+```
+
+The widget reads `~/.codex/usage-monitor/usage.sqlite` every two seconds and
+shows the latest weekly usage percentage, most recent turn token count, model,
+and sample time. It also adds a small menu bar item with the current percentage.
 
 ## Data Model
 

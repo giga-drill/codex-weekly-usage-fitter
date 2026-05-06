@@ -109,6 +109,40 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_today_usage_uses_local_day_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = UsageStore(Path(tmp))
+            try:
+                for turn_id, total, percent in [
+                    ("turn-1", 100, 14.0),
+                    ("turn-2", 180, 20.0),
+                    ("turn-3", 260, 30.0),
+                ]:
+                    snapshot = TranscriptSnapshot(
+                        path="a.jsonl",
+                        token_event_timestamp=turn_id,
+                        total_usage=TokenUsage(total_tokens=total),
+                        last_usage=TokenUsage(total_tokens=total - 90),
+                        weekly_limit=WeeklyLimit(
+                            used_percent=percent,
+                            resets_at=111,
+                        ),
+                    )
+                    store.record_sample(
+                        {"session_id": "s1", "turn_id": turn_id, "model": "m"},
+                        snapshot,
+                    )
+
+                today = store.status()["today_usage"]
+                self.assertEqual(today["first_used_percent"], 14.0)
+                self.assertEqual(today["last_used_percent"], 30.0)
+                self.assertEqual(today["used_percent_delta"], 16.0)
+                self.assertEqual(today["level"], "medium")
+                self.assertEqual(today["token_delta_total"], 160)
+                self.assertEqual(today["sample_count"], 3)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

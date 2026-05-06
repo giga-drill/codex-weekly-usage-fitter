@@ -74,6 +74,12 @@ class UsageCollector:
 
 
 class _UsageRequestHandler(socketserver.StreamRequestHandler):
+    def _write_response(self, payload: bytes) -> None:
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def handle(self) -> None:
         line = self.rfile.readline(1_000_000)
         if not line:
@@ -81,14 +87,14 @@ class _UsageRequestHandler(socketserver.StreamRequestHandler):
         try:
             event = json.loads(line.decode("utf-8"))
         except json.JSONDecodeError:
-            self.wfile.write(b"ERR invalid-json\n")
+            self._write_response(b"ERR invalid-json\n")
             return
         if not isinstance(event, dict):
-            self.wfile.write(b"ERR invalid-event\n")
+            self._write_response(b"ERR invalid-event\n")
             return
         inserted = self.server.collector.process_event(event)  # type: ignore[attr-defined]
         self.server.collector.drain_spool()  # type: ignore[attr-defined]
-        self.wfile.write(b"OK inserted\n" if inserted else b"OK duplicate\n")
+        self._write_response(b"OK inserted\n" if inserted else b"OK duplicate\n")
 
 
 class _UnixUsageServer(socketserver.UnixStreamServer):

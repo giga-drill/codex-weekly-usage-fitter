@@ -6,7 +6,7 @@ import io
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -392,6 +392,47 @@ class UsageStore:
             "latest_sample": _row_to_dict(latest),
             "latest_epoch": _row_to_dict(latest_epoch),
             "latest_fit": _row_to_dict(latest_fit),
+            "today_usage": self.today_usage(),
+        }
+
+    def today_usage(self, now: datetime | None = None) -> dict[str, Any]:
+        local_now = now.astimezone() if now is not None else datetime.now().astimezone()
+        local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = local_start + timedelta(days=1)
+        start_utc = local_start.astimezone(timezone.utc).isoformat(timespec="seconds")
+        end_utc = local_end.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT observed_at, weekly_used_percent, token_delta, last_total_tokens
+                FROM samples
+                WHERE observed_at >= ?
+                  AND observed_at < ?
+                  AND weekly_used_percent IS NOT NULL
+                ORDER BY observed_at, id
+                """,
+                (start_utc, end_utc),
+            )
+        )
+        first_percent = float(rows[0]["weekly_used_percent"]) if rows else None
+        last_percent = float(rows[-1]["weekly_used_percent"]) if rows else None
+        used_delta = (
+            max(0.0, last_percent - first_percent)
+            if first_percent is not None and last_percent is not None
+            else 0.0
+        )
+        return {
+            "date": local_start.date().isoformat(),
+            "first_used_percent": first_percent,
+            "last_used_percent": last_percent,
+            "used_percent_delta": used_delta,
+            "level": _today_usage_level(used_delta),
+            "token_delta_total": sum(int(row["token_delta"] or 0) for row in rows),
+            "last_turn_token_total": int(rows[-1]["last_total_tokens"])
+            if rows and rows[-1]["last_total_tokens"] is not None
+            else None,
+            "sample_count": len(rows),
         }
 
     def export_jsonl(self) -> str:
@@ -476,6 +517,14 @@ def _confidence(sample_count: int, percent_delta: float, external: bool) -> str:
     if not external and percent_delta >= 3 and sample_count >= 10:
         return "high"
     return "medium"
+
+
+def _today_usage_level(used_percent: float) -> str:
+    if used_percent < 15:
+        return "low"
+    if used_percent <= 28:
+        return "medium"
+    return "high"
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

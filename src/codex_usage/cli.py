@@ -178,6 +178,13 @@ def _format_status(status: dict[str, Any]) -> str:
     lines.append(f"Observed tokens, all time: {status['total_observed_tokens']}")
     if status.get("epoch_observed_tokens") is not None:
         lines.append(f"Observed tokens, current epoch: {status['epoch_observed_tokens']}")
+    today = status.get("today_usage")
+    if today:
+        lines.append(
+            "Today usage: "
+            f"{today['used_percent_delta']:.3g}% "
+            f"({today['level']}, samples {today['sample_count']})"
+        )
     lines.append(
         "Latest sample: "
         f"session={latest.get('session_id') or '-'} "
