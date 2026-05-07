@@ -154,6 +154,10 @@ The token-to-usage fit is an estimate. It becomes more useful after enough local
 turns have been observed, especially after the weekly percentage has visibly
 moved.
 
+## License
+
+This project is released under the MIT License. See [LICENSE](LICENSE).
+
 ## 中文说明
 
 [English](#codex-weekly-usage-fitter) | 中文
@@ -302,3 +306,7 @@ weekly 百分比变化，但不能准确归因具体 token 来源。
 
 token 到 usage 的拟合是估算值。观察到的本地对话越多，尤其是在 weekly 百分比发生
 可见变化之后，估算会更有参考价值。
+
+## License / 许可证
+
+本项目使用 MIT License 发布，详见 [LICENSE](LICENSE)。
