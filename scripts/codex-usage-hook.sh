@@ -3,7 +3,8 @@ set -u
 
 MODE="${1:-ensure-daemon}"
 LABEL="gui/$(id -u)/local.codex-usage"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHONPATH_VALUE="$REPO_DIR/src"
 LOG_DIR="$HOME/.codex/usage-monitor"

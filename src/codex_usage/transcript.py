@@ -148,6 +148,7 @@ def parse_transcript(path: str | Path, turn_id: str | None = None) -> Transcript
     latest_weekly_limit: WeeklyLimit | None = None
     latest_plan_type: str | None = None
     latest_payload: dict[str, Any] | None = None
+    target_turn_active = turn_id is None
 
     try:
         with transcript_path.open("r", encoding="utf-8") as handle:
@@ -165,7 +166,11 @@ def parse_transcript(path: str | Path, turn_id: str | None = None) -> Transcript
                 payload = envelope.get("payload")
                 if envelope.get("type") == "turn_context" and isinstance(payload, dict):
                     payload_turn_id = _first(payload, "turn_id", "turnId")
-                    if turn_id is None or payload_turn_id == turn_id:
+                    if turn_id is not None:
+                        if target_turn_active and payload_turn_id != turn_id:
+                            break
+                        target_turn_active = payload_turn_id == turn_id
+                    if target_turn_active:
                         model = _as_text(_first(payload, "model"))
                         effort = _turn_effort(payload)
                         if model is not None:
@@ -178,6 +183,8 @@ def parse_transcript(path: str | Path, turn_id: str | None = None) -> Transcript
                     continue
                 payload_type = _first(payload, "type")
                 if payload_type not in {"token_count", "TokenCount"}:
+                    continue
+                if not target_turn_active:
                     continue
 
                 latest_token_timestamp = _first(envelope, "timestamp")

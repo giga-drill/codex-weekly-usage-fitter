@@ -129,6 +129,80 @@ class TranscriptParserTests(unittest.TestCase):
             self.assertIsNone(snapshot.total_usage)
             self.assertEqual(snapshot.weekly_limit.used_percent, 24.0)
 
+    def test_selects_token_count_for_requested_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            first_turn = {
+                "timestamp": "2026-05-06T01:02:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-1",
+                    "model": "gpt-a",
+                    "effort": "high",
+                },
+            }
+            first_token = {
+                "timestamp": "2026-05-06T01:02:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 100},
+                        "last_token_usage": {"total_tokens": 40},
+                    },
+                    "rate_limits": {
+                        "secondary": {
+                            "used_percent": 18,
+                            "window_minutes": 10080,
+                            "resets_at": 111,
+                        }
+                    },
+                },
+            }
+            second_turn = {
+                "timestamp": "2026-05-06T01:03:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-2",
+                    "model": "gpt-b",
+                    "effort": "medium",
+                },
+            }
+            second_token = {
+                "timestamp": "2026-05-06T01:03:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 175},
+                        "last_token_usage": {"total_tokens": 75},
+                    },
+                    "rate_limits": {
+                        "secondary": {
+                            "used_percent": 19,
+                            "window_minutes": 10080,
+                            "resets_at": 111,
+                        }
+                    },
+                },
+            }
+            path.write_text(
+                "\n".join(
+                    json.dumps(item)
+                    for item in [first_turn, first_token, second_turn, second_token]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = parse_transcript(path, turn_id="turn-1")
+
+            self.assertEqual(snapshot.model, "gpt-a")
+            self.assertEqual(snapshot.reasoning_effort, "high")
+            self.assertEqual(snapshot.total_usage.total_tokens, 100)
+            self.assertEqual(snapshot.last_usage.total_tokens, 40)
+            self.assertEqual(snapshot.weekly_limit.used_percent, 18.0)
+
     def test_missing_transcript_reports_error(self) -> None:
         snapshot = parse_transcript("/tmp/does-not-exist-codex-usage.jsonl")
         self.assertEqual(snapshot.error, "missing transcript")
