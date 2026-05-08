@@ -21,14 +21,19 @@ if [[ ! -d "$PYTHONPATH_VALUE" ]]; then
   exit 0
 fi
 
+log "invoke mode=$MODE cwd=$PWD repo=$REPO_DIR"
+
 if [[ "$MODE" == "sample-stop" ]]; then
   payload="$(cat)"
   launchctl kickstart "$LABEL" >/dev/null 2>&1 || true
   if ! printf '%s' "$payload" | PYTHONPATH="$PYTHONPATH_VALUE" /usr/bin/python3 -m codex_usage sample-stop 2>> "$LOG_FILE"; then
     log "sample-stop failed"
+  else
+    log "sample-stop completed"
   fi
 else
   launchctl kickstart "$LABEL" >/dev/null 2>&1 || true
+  log "ensure-daemon completed"
 fi
 
 exit 0

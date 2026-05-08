@@ -1,5 +1,7 @@
 # Codex Weekly Usage Fitter
 
+Current release: `v0.1.0`
+
 English | [中文](#中文说明)
 
 Codex Weekly Usage Fitter is a small local monitor for Codex usage. It records
@@ -83,6 +85,10 @@ codex-usage status
 You should see your latest weekly usage percentage, last-turn tokens, model,
 reasoning effort, today's usage, and the current token-to-usage fit.
 
+In this project, "last-turn tokens" means the latest observed sample delta
+(`samples.token_delta`), not the transcript's internal last sub-step token
+counter.
+
 ## macOS Desktop Widget
 
 Build and open the native floating widget:
@@ -99,6 +105,13 @@ The widget shows:
 - The latest model and reasoning effort.
 - Last-turn token usage.
 - The current estimate for turns and tokens per 1% weekly usage.
+
+The last-turn token number is always based on `samples.token_delta` so desktop
+and stats views use the same user-facing token policy.
+
+For turn estimation, this project treats one user-visible turn as one positive
+`token_delta` interval. Baseline samples and zero-delta samples are not counted
+as turns.
 
 The widget can be dragged around the desktop and switched between a compact view
 and a full view with the button in the top-right corner.
@@ -161,6 +174,8 @@ This project is released under the MIT License. See [LICENSE](LICENSE).
 ## 中文说明
 
 [English](#codex-weekly-usage-fitter) | 中文
+
+当前版本：`v0.1.0`
 
 Codex Weekly Usage Fitter 是一个本地 Codex 用量监控工具。它会在本机记录
 Codex 对话产生的 token 用量，读取 Codex 当前显示的每周 usage 百分比，并估算
@@ -241,6 +256,9 @@ codex-usage status
 你应该能看到当前 weekly usage、上一轮 token、模型、reasoning effort、今日用量，
 以及当前 token 到 usage 的拟合估算。
 
+这里“上一轮 token”统一指最新一次采样间隔的增量（`samples.token_delta`），不是
+transcript 内部某个子步骤的 last token 计数。
+
 ## macOS 桌面小组件
 
 构建并打开原生桌面悬浮组件：
@@ -257,6 +275,12 @@ open "build/Codex Usage.app"
 - 最新一轮使用的模型和 reasoning effort。
 - 上一轮消耗的 token。
 - 当前估算的 1% weekly usage 对应多少轮和多少 token。
+
+小组件里展示的上一轮 token 统一来自 `samples.token_delta`，确保桌面主面板和统计
+面板口径一致。
+
+在轮次估算里，本项目把“1 轮对话”定义为一次 `token_delta > 0` 的采样间隔；
+baseline 样本和 `token_delta = 0` 的样本不会计入轮次。
 
 小组件可以拖动，也可以用右上角按钮在简略视图和完整视图之间切换。
 

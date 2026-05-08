@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .collector import enqueue_stop_event, run_daemon
+from .collector import UsageCollector, enqueue_stop_event, run_daemon_with_scan
 from .paths import usage_home
 from .store import UsageStore
 
@@ -23,6 +23,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_sample_stop(home, args)
     if args.command == "daemon":
         return _cmd_daemon(home, args)
+    if args.command == "scan-transcripts":
+        return _cmd_scan_transcripts(home, args)
     if args.command == "status":
         return _cmd_status(home, args)
     if args.command == "billing-stats":
@@ -43,6 +45,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
     daemon = sub.add_parser("daemon", help="run the local collector daemon")
     daemon.add_argument(
+        "--no-app-server",
+        action="store_true",
+        help="disable account/rateLimits/read fallback",
+    )
+    daemon.add_argument(
+        "--scan-interval",
+        type=float,
+        default=10,
+        help="seconds between transcript fallback scans",
+    )
+
+    scan = sub.add_parser(
+        "scan-transcripts",
+        help="scan recent Codex transcripts without waiting for hooks",
+    )
+    scan.add_argument(
+        "--since-hours",
+        type=float,
+        default=48,
+        help="scan transcripts modified in the last N hours",
+    )
+    scan.add_argument(
         "--no-app-server",
         action="store_true",
         help="disable account/rateLimits/read fallback",
@@ -115,7 +139,23 @@ def _cmd_sample_stop(home: Path, args: argparse.Namespace) -> int:
 
 
 def _cmd_daemon(home: Path, args: argparse.Namespace) -> int:
-    run_daemon(home, use_app_server=not args.no_app_server)
+    run_daemon_with_scan(
+        home,
+        use_app_server=not args.no_app_server,
+        scan_interval_seconds=args.scan_interval,
+    )
+    return 0
+
+
+def _cmd_scan_transcripts(home: Path, args: argparse.Namespace) -> int:
+    collector = UsageCollector(home, delay_seconds=0, use_app_server=not args.no_app_server)
+    try:
+        inserted = collector.scan_recent_transcripts(
+            since_seconds=max(0, args.since_hours) * 3600
+        )
+    finally:
+        collector.close()
+    print(f"Inserted {inserted} transcript sample(s).")
     return 0
 
 
@@ -203,8 +243,12 @@ def _format_status(status: dict[str, Any]) -> str:
     latest = status.get("latest_sample")
     fit = status.get("latest_fit")
     epoch = status.get("latest_epoch")
-    model_effort_fit = status.get("latest_model_effort_fit")
+    model_effort_key = status.get("latest_model_effort_key") or {}
+    model_effort_fit = status.get("latest_clean_model_effort_fit") or status.get(
+        "latest_model_effort_fit"
+    )
     model_effort_fits = status.get("model_effort_fits") or []
+    mixed_events = status.get("latest_mixed_movement_events") or []
     lines = ["Codex weekly usage fitter"]
     lines.append(f"Home: {status['home']}")
     lines.append(
@@ -242,6 +286,12 @@ def _format_status(status: dict[str, Any]) -> str:
         f"delta={latest.get('token_delta')} "
         f"total={latest.get('token_total')}"
     )
+    if model_effort_key:
+        lines.append(
+            "Current model/effort: "
+            f"{model_effort_key.get('model') or 'unknown'}/"
+            f"{model_effort_key.get('reasoning_effort') or 'unknown'}"
+        )
 
     if fit:
         tpp = fit.get("tokens_per_weekly_percent")
@@ -263,11 +313,27 @@ def _format_status(status: dict[str, Any]) -> str:
         lines.append("Fit: waiting for more samples")
 
     if model_effort_fit:
-        lines.append("Model/effort fit: " + _format_model_effort_fit(model_effort_fit))
+        lines.append(
+            "Latest clean model/effort estimate: "
+            + _format_model_effort_fit(model_effort_fit)
+        )
     elif model_effort_fits:
         lines.append("Model/effort fits:")
         for group in model_effort_fits[:3]:
             lines.append("  - " + _format_model_effort_fit(group))
+    else:
+        lines.append("Latest clean model/effort estimate: waiting for clean movement")
+
+    if mixed_events:
+        lines.append("Recent mixed movement observations:")
+        for event in mixed_events[:3]:
+            lines.append(
+                "  - "
+                f"{event.get('combination') or 'unknown'}: "
+                f"+{event.get('percent_delta', 0):.3g}% "
+                f"{_format_token_count(event.get('token_delta_total'))}, "
+                f"{event.get('turn_count', 0)} turns"
+            )
 
     return "\n".join(lines)
 
@@ -309,6 +375,16 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
                 f"{_format_token_count(day['token_delta_total']):>9}   "
                 f"{day['turn_count']} turns"
             )
+    mixed_combinations = stats.get("mixed_movement_combinations") or []
+    if mixed_combinations:
+        lines.append("")
+        lines.append("Mixed movement observations")
+        for item in mixed_combinations:
+            lines.append(
+                f"{item['combination']}: +{item['percent_delta']:.3g}%   "
+                f"{_format_token_count(item['token_delta_total'])}   "
+                f"{item['turn_count']} turns   {item['event_count']} events"
+            )
     if debug:
         lines.append("")
         lines.append("Samples used")
@@ -323,6 +399,17 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
                 f"delta={_format_token_count(sample['token_delta']):>9} "
                 f"model={model}/{effort} turn={sample.get('turn_id') or '-'}"
             )
+        mixed_events = stats.get("mixed_movement_events") or []
+        if mixed_events:
+            lines.append("")
+            lines.append("Mixed movement events")
+            for event in mixed_events:
+                lines.append(
+                    f"{event.get('observed_at_local') or event.get('observed_at')}  "
+                    f"{event['combination']}  +{event['percent_delta']:.3g}%  "
+                    f"delta={_format_token_count(event['token_delta_total'])}  "
+                    f"turns={event['turn_count']}"
+                )
     return "\n".join(lines)
 
 

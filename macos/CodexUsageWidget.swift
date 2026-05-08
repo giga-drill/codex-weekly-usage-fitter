@@ -63,6 +63,8 @@ private struct BillingStatsSnapshot {
     var label: String
     var period: BillingMetricSnapshot
     var windows: [BillingWindowSnapshot]
+    var mixedEvents: [BillingMixedMovementEvent]
+    var mixedCombinations: [BillingMixedMovementCombination]
 }
 
 private struct BillingDaySnapshot {
@@ -87,6 +89,30 @@ private struct BillingSampleRow {
     var model: String?
     var reasoningEffort: String?
     var turnId: String?
+}
+
+private struct BillingMovementBucket {
+    var model: String
+    var reasoningEffort: String
+    var tokenDeltaTotal: Int64
+    var turnCount: Int
+}
+
+private struct BillingMixedMovementEvent {
+    var observedAt: Date
+    var percentDelta: Double
+    var tokenDeltaTotal: Int64
+    var turnCount: Int
+    var combination: String
+    var buckets: [BillingMovementBucket]
+}
+
+private struct BillingMixedMovementCombination {
+    var combination: String
+    var eventCount: Int
+    var percentDelta: Double
+    var tokenDeltaTotal: Int64
+    var turnCount: Int
 }
 
 private struct UsageSettings: Codable {
@@ -193,7 +219,13 @@ private final class UsageReader {
                 tokenDeltaTotal: 0,
                 turnCount: 0
             )
-            return BillingStatsSnapshot(label: selection.title, period: empty, windows: [])
+            return BillingStatsSnapshot(
+                label: selection.title,
+                period: empty,
+                windows: [],
+                mixedEvents: [],
+                mixedCombinations: []
+            )
         }
         defer { sqlite3_close(db) }
 
@@ -291,10 +323,18 @@ private final class UsageReader {
                 }
             )
         }
+        let mixedEvents = mixedMovementEvents(
+            db,
+            startDate: periodStart,
+            endDate: periodEnd
+        )
+        let mixedCombinations = mixedMovementCombinations(from: mixedEvents)
         return BillingStatsSnapshot(
             label: label,
             period: periodAccumulator.snapshot(),
-            windows: windows
+            windows: windows,
+            mixedEvents: mixedEvents,
+            mixedCombinations: mixedCombinations
         )
     }
 
@@ -303,7 +343,7 @@ private final class UsageReader {
             ? "reasoning_effort"
             : "NULL AS reasoning_effort"
         let usableSql = """
-        SELECT weekly_used_percent, last_total_tokens, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
+        SELECT weekly_used_percent, token_delta, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
         FROM samples
         WHERE parse_error IS NULL
           AND weekly_used_percent IS NOT NULL
@@ -311,7 +351,7 @@ private final class UsageReader {
         LIMIT 1
         """
         let fallbackSql = """
-        SELECT weekly_used_percent, last_total_tokens, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
+        SELECT weekly_used_percent, token_delta, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
         FROM samples
         ORDER BY id DESC
         LIMIT 1
@@ -505,6 +545,120 @@ private final class UsageReader {
         return rows
     }
 
+    private func mixedMovementEvents(
+        _ db: OpaquePointer?,
+        startDate: Date,
+        endDate: Date
+    ) -> [BillingMixedMovementEvent] {
+        guard hasColumn(db, table: "usage_movement_events", column: "buckets_json") else {
+            return []
+        }
+        let sql = """
+        SELECT observed_at, percent_delta, token_delta_total, turn_count, buckets_json
+        FROM usage_movement_events
+        WHERE observed_at >= ?
+          AND observed_at < ?
+          AND bucket_count > 1
+        ORDER BY observed_at, id
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, index: 1, value: sqliteUTCString(startDate))
+        bindText(statement, index: 2, value: sqliteUTCString(endDate))
+
+        var output: [BillingMixedMovementEvent] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let observedText = stringColumn(statement, 0),
+                  let observedAt = parseSQLiteTimestamp(observedText) else {
+                continue
+            }
+            let buckets = parseMovementBuckets(stringColumn(statement, 4))
+            let combination = movementCombinationLabel(buckets)
+            output.append(
+                BillingMixedMovementEvent(
+                    observedAt: observedAt,
+                    percentDelta: doubleColumn(statement, 1) ?? 0,
+                    tokenDeltaTotal: intColumn(statement, 2) ?? 0,
+                    turnCount: Int(intColumn(statement, 3) ?? 0),
+                    combination: combination,
+                    buckets: buckets
+                )
+            )
+        }
+        return output
+    }
+
+    private func mixedMovementCombinations(
+        from events: [BillingMixedMovementEvent]
+    ) -> [BillingMixedMovementCombination] {
+        var summary: [String: BillingMixedMovementCombination] = [:]
+        for event in events {
+            if var bucket = summary[event.combination] {
+                bucket.eventCount += 1
+                bucket.percentDelta += event.percentDelta
+                bucket.tokenDeltaTotal += event.tokenDeltaTotal
+                bucket.turnCount += event.turnCount
+                summary[event.combination] = bucket
+            } else {
+                summary[event.combination] = BillingMixedMovementCombination(
+                    combination: event.combination,
+                    eventCount: 1,
+                    percentDelta: event.percentDelta,
+                    tokenDeltaTotal: event.tokenDeltaTotal,
+                    turnCount: event.turnCount
+                )
+            }
+        }
+        return summary.values.sorted {
+            if $0.percentDelta == $1.percentDelta {
+                return $0.tokenDeltaTotal > $1.tokenDeltaTotal
+            }
+            return $0.percentDelta > $1.percentDelta
+        }
+    }
+
+    private func parseMovementBuckets(_ text: String?) -> [BillingMovementBucket] {
+        guard let text,
+              let data = text.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data),
+              let rows = value as? [[String: Any]] else {
+            return []
+        }
+        var output: [BillingMovementBucket] = []
+        output.reserveCapacity(rows.count)
+        for row in rows {
+            let modelText = (row["model"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawEffort = row["reasoning_effort"] as? String
+            let effort = normalizedEffort(rawEffort) ?? "unknown"
+            let tokenValue = row["token_delta_total"] as? NSNumber
+            let turnValue = row["turn_count"] as? NSNumber
+            let model = (modelText?.isEmpty == false ? modelText : nil) ?? "unknown"
+            output.append(
+                BillingMovementBucket(
+                    model: model,
+                    reasoningEffort: effort,
+                    tokenDeltaTotal: tokenValue?.int64Value ?? 0,
+                    turnCount: turnValue?.intValue ?? 0
+                )
+            )
+        }
+        return output
+    }
+
+    private func movementCombinationLabel(_ buckets: [BillingMovementBucket]) -> String {
+        if buckets.isEmpty {
+            return "unknown"
+        }
+        let labels = buckets.map { bucket in
+            "\(bucket.model)/\(bucket.reasoningEffort)"
+        }
+        return labels.sorted().joined(separator: " + ")
+    }
+
     private func intScalar(_ db: OpaquePointer?, _ sql: String) -> Int64 {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -543,7 +697,9 @@ private struct BillingMetricAccumulator {
     mutating func addSample(tokenDelta: Int64, usageDelta: Double) {
         usagePercentDelta += usageDelta
         tokenDeltaTotal += tokenDelta
-        turnCount += 1
+        if tokenDelta > 0 {
+            turnCount += 1
+        }
     }
 
     func contains(_ date: Date) -> Bool {
@@ -570,6 +726,61 @@ private final class DragView: NSView {
 private final class DragLabel: NSTextField {
     override var mouseDownCanMoveWindow: Bool {
         true
+    }
+}
+
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    private func adjustedFrame(toVerticallyCenterText rect: NSRect) -> NSRect {
+        var titleRect = super.titleRect(forBounds: rect)
+        let minimumHeight = cellSize(forBounds: rect).height
+        let heightDelta = titleRect.height - minimumHeight
+        if heightDelta > 0 {
+            titleRect.origin.y += floor(heightDelta / 2.0)
+            titleRect.size.height = minimumHeight
+        }
+        return titleRect
+    }
+
+    override func titleRect(forBounds rect: NSRect) -> NSRect {
+        adjustedFrame(toVerticallyCenterText: rect)
+    }
+
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        super.drawInterior(withFrame: adjustedFrame(toVerticallyCenterText: cellFrame), in: controlView)
+    }
+
+    override func edit(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObj: NSText,
+        delegate: Any?,
+        event: NSEvent?
+    ) {
+        super.edit(
+            withFrame: adjustedFrame(toVerticallyCenterText: rect),
+            in: controlView,
+            editor: textObj,
+            delegate: delegate,
+            event: event
+        )
+    }
+
+    override func select(
+        withFrame rect: NSRect,
+        in controlView: NSView,
+        editor textObj: NSText,
+        delegate: Any?,
+        start selStart: Int,
+        length selLength: Int
+    ) {
+        super.select(
+            withFrame: adjustedFrame(toVerticallyCenterText: rect),
+            in: controlView,
+            editor: textObj,
+            delegate: delegate,
+            start: selStart,
+            length: selLength
+        )
     }
 }
 
@@ -905,7 +1116,7 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func showStats() {
-        statsController.show(anchor: window.frame)
+        statsController.show(anchor: resizeSourceFrame())
     }
 
     @objc private func hideWindow() {
@@ -921,6 +1132,9 @@ private enum StatsTreeKind {
     case week
     case day
     case sample
+    case mixedSection
+    case mixedCombination
+    case mixedEvent
 }
 
 private final class StatsTreeNode {
@@ -952,6 +1166,8 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     private let tokenLabel = NSTextField(labelWithString: "Tokens: --")
     private let turnLabel = NSTextField(labelWithString: "Turns: --")
     private let avgLabel = NSTextField(labelWithString: "Avg / turn: --")
+    private let cleanFitLabel = NSTextField(labelWithString: "Clean 1%: --")
+    private let mixedLabel = NSTextField(labelWithString: "Mixed: --")
     private let outlineView = NSOutlineView(frame: .zero)
     private let scrollView = NSScrollView()
     private var treeRoots: [StatsTreeNode] = []
@@ -1025,8 +1241,12 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     private func position(near anchor: NSRect) {
         guard let screen = NSScreen.main else { return }
         let visible = screen.visibleFrame
+        let gap: CGFloat = 12
         var x = anchor.maxX - window.frame.width
-        var y = anchor.minY - 12
+        var y = anchor.minY - window.frame.height - gap
+        if y < visible.minY + 10 {
+            y = anchor.maxY + gap
+        }
         x = max(visible.minX + 10, min(x, visible.maxX - window.frame.width - 10))
         y = max(visible.minY + 10, min(y, visible.maxY - window.frame.height - 10))
         window.setFrameOrigin(NSPoint(x: x, y: y))
@@ -1039,24 +1259,29 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         root.layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 0.98).cgColor
         window.contentView = root
 
-        titleLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
         titleLabel.textColor = .white
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        rangeLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        rangeLabel.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .medium)
         rangeLabel.textColor = NSColor.white.withAlphaComponent(0.72)
         rangeLabel.translatesAutoresizingMaskIntoConstraints = false
 
         configurePeriodButton(periodThisButton, action: #selector(selectThisPeriod))
         configurePeriodButton(periodLastButton, action: #selector(selectLastPeriod))
 
+        billingDayField.cell = VerticallyCenteredTextFieldCell(textCell: "")
         billingDayField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         billingDayField.alignment = .center
+        billingDayField.isEditable = true
+        billingDayField.isSelectable = true
         billingDayField.backgroundColor = NSColor.white.withAlphaComponent(0.95)
+        billingDayField.drawsBackground = false
         billingDayField.textColor = .black
         billingDayField.isBordered = false
         billingDayField.focusRingType = .none
         billingDayField.wantsLayer = true
+        billingDayField.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.95).cgColor
         billingDayField.layer?.cornerRadius = 6
         billingDayField.layer?.masksToBounds = true
         billingDayField.translatesAutoresizingMaskIntoConstraints = false
@@ -1083,14 +1308,28 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         tokenLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         turnLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
         avgLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
-        [usageLabel, tokenLabel, turnLabel, avgLabel].forEach { label in
+        cleanFitLabel.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)
+        mixedLabel.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)
+        [usageLabel, tokenLabel, turnLabel, avgLabel, cleanFitLabel, mixedLabel].forEach { label in
             label.textColor = NSColor.white.withAlphaComponent(0.9)
             label.translatesAutoresizingMaskIntoConstraints = false
         }
-        let summaryStack = NSStackView(views: [usageLabel, tokenLabel, turnLabel, avgLabel])
+        let periodSummaryRow = NSStackView(views: [usageLabel, tokenLabel, turnLabel])
+        periodSummaryRow.orientation = .horizontal
+        periodSummaryRow.alignment = .firstBaseline
+        periodSummaryRow.spacing = 14
+        periodSummaryRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let detailSummaryStack = NSStackView(views: [avgLabel, cleanFitLabel, mixedLabel])
+        detailSummaryStack.orientation = .vertical
+        detailSummaryStack.alignment = .leading
+        detailSummaryStack.spacing = 3
+        detailSummaryStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let summaryStack = NSStackView(views: [periodSummaryRow, detailSummaryStack])
         summaryStack.orientation = .vertical
         summaryStack.alignment = .leading
-        summaryStack.spacing = 3
+        summaryStack.spacing = 5
         summaryStack.translatesAutoresizingMaskIntoConstraints = false
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("detail"))
@@ -1116,16 +1355,10 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         scrollView.drawsBackground = false
         scrollView.documentView = outlineView
 
-        let billingCaption = NSTextField(labelWithString: "Billing day")
-        billingCaption.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        billingCaption.textColor = NSColor.white.withAlphaComponent(0.72)
-        billingCaption.translatesAutoresizingMaskIntoConstraints = false
-
         root.addSubview(titleLabel)
         root.addSubview(rangeLabel)
         root.addSubview(periodThisButton)
         root.addSubview(periodLastButton)
-        root.addSubview(billingCaption)
         root.addSubview(billingDayField)
         root.addSubview(billingDayStepper)
         root.addSubview(saveButton)
@@ -1133,36 +1366,39 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         root.addSubview(scrollView)
 
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            titleLabel.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            rangeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            rangeLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-
-            periodLastButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            periodLastButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            periodLastButton.widthAnchor.constraint(equalToConstant: 84),
-            periodLastButton.heightAnchor.constraint(equalToConstant: 24),
-            periodThisButton.trailingAnchor.constraint(equalTo: periodLastButton.leadingAnchor, constant: -8),
-            periodThisButton.centerYAnchor.constraint(equalTo: periodLastButton.centerYAnchor),
-            periodThisButton.widthAnchor.constraint(equalToConstant: 84),
-            periodThisButton.heightAnchor.constraint(equalToConstant: 24),
-
-            billingCaption.trailingAnchor.constraint(equalTo: periodLastButton.trailingAnchor),
-            billingCaption.topAnchor.constraint(equalTo: periodLastButton.bottomAnchor, constant: 10),
-            billingDayField.trailingAnchor.constraint(equalTo: billingCaption.trailingAnchor),
-            billingDayField.topAnchor.constraint(equalTo: billingCaption.bottomAnchor, constant: 4),
+            billingDayField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            billingDayField.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
             billingDayField.widthAnchor.constraint(equalToConstant: 44),
             billingDayField.heightAnchor.constraint(equalToConstant: 24),
-            billingDayStepper.trailingAnchor.constraint(equalTo: billingDayField.leadingAnchor, constant: -6),
+
+            billingDayStepper.leadingAnchor.constraint(equalTo: billingDayField.trailingAnchor, constant: 6),
             billingDayStepper.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
-            saveButton.trailingAnchor.constraint(equalTo: billingDayStepper.leadingAnchor, constant: -8),
+
+            saveButton.leadingAnchor.constraint(equalTo: billingDayStepper.trailingAnchor, constant: 8),
             saveButton.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
             saveButton.widthAnchor.constraint(equalToConstant: 44),
             saveButton.heightAnchor.constraint(equalToConstant: 24),
 
+            periodThisButton.leadingAnchor.constraint(equalTo: saveButton.trailingAnchor, constant: 10),
+            periodThisButton.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
+            periodThisButton.widthAnchor.constraint(equalToConstant: 84),
+            periodThisButton.heightAnchor.constraint(equalToConstant: 24),
+
+            periodLastButton.leadingAnchor.constraint(equalTo: periodThisButton.trailingAnchor, constant: 8),
+            periodLastButton.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
+            periodLastButton.widthAnchor.constraint(equalToConstant: 84),
+            periodLastButton.heightAnchor.constraint(equalToConstant: 24),
+            periodLastButton.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
+
+            titleLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            titleLabel.topAnchor.constraint(equalTo: billingDayField.bottomAnchor, constant: 10),
+            rangeLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
+            rangeLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            rangeLabel.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
+
             summaryStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            summaryStack.topAnchor.constraint(equalTo: rangeLabel.bottomAnchor, constant: 14),
-            summaryStack.trailingAnchor.constraint(lessThanOrEqualTo: saveButton.leadingAnchor, constant: -10),
+            summaryStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            summaryStack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
 
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
@@ -1211,6 +1447,7 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
             billingDay: settings.billingDay,
             selection: periodSelection
         )
+        let latestSnapshot = reader.read()
         titleLabel.stringValue = stats.label
         rangeLabel.stringValue = "\(formatMonthDay(stats.period.start)) - \(formatMonthDay(stats.period.end))"
         usageLabel.stringValue = "Usage: +\(formatPercentCompact(stats.period.usagePercentDelta))%"
@@ -1221,7 +1458,20 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         } else {
             avgLabel.stringValue = "Avg / turn: --"
         }
-        treeRoots = buildTree(windows: stats.windows)
+        let modelText = modelDisplayName(latestSnapshot.model, effort: latestSnapshot.reasoningEffort)
+        if let turns = latestSnapshot.fitTurnsPerPercent,
+           let tokens = latestSnapshot.fitTokensPerPercent {
+            cleanFitLabel.stringValue = "Clean 1% (\(modelText)): \(formatTurns(turns)) turns / \(formatTokenCount(tokens)) tok"
+        } else {
+            cleanFitLabel.stringValue = "Clean 1% (\(modelText)): waiting for clean movement"
+        }
+        if stats.mixedEvents.isEmpty {
+            mixedLabel.stringValue = "Mixed: none in this period"
+        } else {
+            let totalPercent = stats.mixedCombinations.reduce(0.0) { $0 + $1.percentDelta }
+            mixedLabel.stringValue = "Mixed: \(stats.mixedEvents.count) events / +\(formatPercentCompact(totalPercent))%"
+        }
+        treeRoots = buildTree(stats: stats)
         outlineView.reloadData()
         if collapseOnNextRefresh {
             collapseAll()
@@ -1231,8 +1481,8 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         resizeWindowToVisibleRows(animated: window.isVisible)
     }
 
-    private func buildTree(windows: [BillingWindowSnapshot]) -> [StatsTreeNode] {
-        windows.map { window in
+    private func buildTree(stats: BillingStatsSnapshot) -> [StatsTreeNode] {
+        var roots = stats.windows.map { window in
             let dayChildren = window.days.map { day -> StatsTreeNode in
                 let sampleChildren = day.samples.map { sample in
                     StatsTreeNode(
@@ -1252,6 +1502,41 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
                 children: dayChildren
             )
         }
+        let mixedCombinationNodes = stats.mixedCombinations.map { combination in
+            let eventNodes = stats.mixedEvents
+                .filter { $0.combination == combination.combination }
+                .map { event in
+                    StatsTreeNode(
+                        text: mixedEventLine(event),
+                        kind: .mixedEvent
+                    )
+                }
+            return StatsTreeNode(
+                text: mixedCombinationLine(combination),
+                kind: .mixedCombination,
+                children: eventNodes
+            )
+        }
+        if mixedCombinationNodes.isEmpty {
+            roots.append(
+                StatsTreeNode(
+                    text: "Mixed movement observations   none in this period",
+                    kind: .mixedSection
+                )
+            )
+        } else {
+            let totalPercent = stats.mixedCombinations.reduce(0.0) { $0 + $1.percentDelta }
+            let totalTokens = stats.mixedCombinations.reduce(Int64(0)) { $0 + $1.tokenDeltaTotal }
+            let totalTurns = stats.mixedCombinations.reduce(0) { $0 + $1.turnCount }
+            roots.append(
+                StatsTreeNode(
+                    text: "Mixed movement observations   +\(formatPercentCompact(totalPercent))%   \(formatTokenCount(Double(totalTokens))) tok   \(totalTurns) turns",
+                    kind: .mixedSection,
+                    children: mixedCombinationNodes
+                )
+            )
+        }
+        return roots
     }
 
     private func weekLine(_ metric: BillingMetricSnapshot) -> String {
@@ -1263,11 +1548,19 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     }
 
     private func sampleLine(_ sample: BillingSampleDetail) -> String {
-        let time = formatHourMinute(sample.observedAt)
-        let usage = sample.weeklyUsedPercent.map { "\(formatPercentCompact($0))%" } ?? "--"
         let movement = "+\(formatPercentCompact(sample.usagePercentDelta))%"
+        let tokenText = "\(formatTokenCount(Double(sample.tokenDelta))) tok"
         let model = modelDisplayName(sample.model, effort: sample.reasoningEffort)
-        return "\(time)  weekly \(usage)  move \(movement)  \(formatTokenCount(Double(sample.tokenDelta))) tok  \(model)"
+        return "\(movement)  \(tokenText)  \(model)"
+    }
+
+    private func mixedCombinationLine(_ combination: BillingMixedMovementCombination) -> String {
+        "\(combination.combination)   \(combination.eventCount)x   +\(formatPercentCompact(combination.percentDelta))%   \(formatTokenCount(Double(combination.tokenDeltaTotal))) tok   \(combination.turnCount) turns"
+    }
+
+    private func mixedEventLine(_ event: BillingMixedMovementEvent) -> String {
+        let at = formatMonthDay(event.observedAt) + " " + formatHourMinute(event.observedAt)
+        return "\(at)   +\(formatPercentCompact(event.percentDelta))%   \(formatTokenCount(Double(event.tokenDeltaTotal))) tok   \(event.turnCount) turns"
     }
 
     private func collapseAll() {
@@ -1377,6 +1670,15 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         case .sample:
             cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
             cell.textField?.textColor = NSColor.white.withAlphaComponent(0.72)
+        case .mixedSection:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .semibold)
+            cell.textField?.textColor = NSColor.systemOrange.withAlphaComponent(0.96)
+        case .mixedCombination:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+            cell.textField?.textColor = NSColor.white.withAlphaComponent(0.86)
+        case .mixedEvent:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+            cell.textField?.textColor = NSColor.white.withAlphaComponent(0.72)
         }
         return cell
     }
@@ -1420,9 +1722,6 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         refresh()
     }
 
-    func windowWillClose(_ notification: Notification) {
-        return
-    }
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
