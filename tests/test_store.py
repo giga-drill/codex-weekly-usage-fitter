@@ -3,13 +3,44 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from codex_usage.store import UsageStore
 from codex_usage.transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit
 
 
 class StoreTests(unittest.TestCase):
+    def insert_sample(
+        self,
+        store: UsageStore,
+        event_id: str,
+        observed_at: str,
+        token_delta: int,
+        weekly_used_percent: float,
+    ) -> None:
+        with store.conn:
+            store.conn.execute(
+                """
+                INSERT INTO samples (
+                    event_id, observed_at, token_delta, weekly_used_percent,
+                    session_id, turn_id, model, reasoning_effort
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    observed_at,
+                    token_delta,
+                    weekly_used_percent,
+                    "session",
+                    event_id,
+                    "gpt-test",
+                    "high",
+                ),
+            )
+
     def test_first_session_sample_is_baseline_then_delta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = UsageStore(Path(tmp))
@@ -168,6 +199,56 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_model_effort_global_fit_aggregates_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = UsageStore(Path(tmp))
+            try:
+                samples = [
+                    ("turn-1", 1_000, 10.0, 111, "gpt-a", "high"),
+                    ("turn-2", 3_000, 11.0, 111, "gpt-a", "high"),
+                    ("turn-3", 3_200, 5.0, 222, "gpt-a", "high"),
+                    ("turn-4", 6_200, 7.0, 222, "gpt-a", "high"),
+                ]
+                for turn_id, total, percent, reset, model, effort in samples:
+                    snapshot = TranscriptSnapshot(
+                        path="a.jsonl",
+                        token_event_timestamp=turn_id,
+                        total_usage=TokenUsage(total_tokens=total),
+                        weekly_limit=WeeklyLimit(
+                            used_percent=percent,
+                            resets_at=reset,
+                        ),
+                    )
+                    store.record_sample(
+                        {
+                            "session_id": "s1",
+                            "turn_id": turn_id,
+                            "model": model,
+                            "reasoning_effort": effort,
+                        },
+                        snapshot,
+                    )
+
+                status = store.status()
+                global_groups = {
+                    (fit["model"], fit["reasoning_effort"]): fit
+                    for fit in status["model_effort_global_fits"]
+                }
+                fit = global_groups[("gpt-a", "high")]
+                self.assertEqual(fit["epoch_count"], 2)
+                self.assertEqual(fit["sample_count"], 2)
+                self.assertEqual(fit["token_delta_total"], 5_000)
+                self.assertEqual(fit["percent_delta"], 3.0)
+                self.assertAlmostEqual(fit["tokens_per_weekly_percent"], 5000 / 3)
+                self.assertAlmostEqual(fit["turns_per_weekly_percent"], 2 / 3)
+                self.assertEqual(status["latest_model_effort_fit"], fit)
+                self.assertNotEqual(
+                    status["latest_model_effort_weekly_fit"]["tokens_per_weekly_percent"],
+                    fit["tokens_per_weekly_percent"],
+                )
+            finally:
+                store.close()
+
     def test_today_usage_uses_local_day_delta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = UsageStore(Path(tmp))
@@ -199,6 +280,77 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(today["level"], "medium")
                 self.assertEqual(today["token_delta_total"], 160)
                 self.assertEqual(today["sample_count"], 3)
+            finally:
+                store.close()
+
+    def test_billing_stats_accumulates_positive_usage_after_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = UsageStore(Path(tmp))
+            try:
+                self.insert_sample(store, "before", "2026-05-11T15:59:00+00:00", 50, 98.0)
+                self.insert_sample(store, "reset", "2026-05-12T02:00:00+00:00", 100, 2.0)
+                self.insert_sample(store, "growth", "2026-05-13T02:00:00+00:00", 200, 3.5)
+
+                stats = store.billing_stats(
+                    billing_day=12,
+                    timezone_name="Asia/Shanghai",
+                    now=datetime(2026, 5, 20, 12, tzinfo=ZoneInfo("Asia/Shanghai")),
+                    debug=True,
+                )
+
+                self.assertEqual(stats["period"]["start"], "2026-05-12")
+                self.assertEqual(stats["period"]["end"], "2026-06-12")
+                self.assertEqual(stats["period"]["token_delta_total"], 300)
+                self.assertEqual(stats["period"]["turn_count"], 2)
+                self.assertEqual(stats["period"]["usage_percent_delta"], 1.5)
+                self.assertEqual(len(stats["debug_samples"]), 2)
+                day_totals = [
+                    day["usage_percent_delta"]
+                    for window in stats["weekly_windows"]
+                    for day in window["days"]
+                ]
+                self.assertAlmostEqual(sum(day_totals), 1.5)
+            finally:
+                store.close()
+
+    def test_billing_stats_previous_period(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = UsageStore(Path(tmp))
+            try:
+                self.insert_sample(store, "apr13", "2026-04-13T02:00:00+00:00", 100, 10.0)
+                self.insert_sample(store, "apr14", "2026-04-14T02:00:00+00:00", 300, 11.0)
+                self.insert_sample(store, "may13", "2026-05-13T02:00:00+00:00", 900, 20.0)
+
+                stats = store.billing_stats(
+                    billing_day=12,
+                    period="previous",
+                    timezone_name="Asia/Shanghai",
+                    now=datetime(2026, 5, 20, 12, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+
+                self.assertEqual(stats["label"], "Last billing period")
+                self.assertEqual(stats["period"]["start"], "2026-04-12")
+                self.assertEqual(stats["period"]["end"], "2026-05-12")
+                self.assertEqual(stats["period"]["token_delta_total"], 400)
+                self.assertEqual(stats["period"]["turn_count"], 2)
+                self.assertEqual(stats["period"]["usage_percent_delta"], 1.0)
+            finally:
+                store.close()
+
+    def test_billing_stats_clamps_billing_day_to_month_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = UsageStore(Path(tmp))
+            try:
+                stats = store.billing_stats(
+                    billing_day=31,
+                    timezone_name="Asia/Shanghai",
+                    now=datetime(2026, 3, 15, 12, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+
+                self.assertEqual(stats["period"]["start"], "2026-02-28")
+                self.assertEqual(stats["period"]["end"], "2026-03-31")
+                self.assertEqual(stats["weekly_windows"][-1]["start"], "2026-03-28")
+                self.assertEqual(stats["weekly_windows"][-1]["end"], "2026-03-31")
             finally:
                 store.close()
 

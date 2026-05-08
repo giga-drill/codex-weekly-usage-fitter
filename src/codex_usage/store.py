@@ -6,9 +6,10 @@ import io
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from .paths import db_path, ensure_usage_dirs
 from .transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit, parse_transcript
@@ -111,6 +112,21 @@ class UsageStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (weekly_resets_at, model, reasoning_effort)
             );
+
+            CREATE TABLE IF NOT EXISTS model_effort_global_fits (
+                model TEXT NOT NULL,
+                reasoning_effort TEXT NOT NULL,
+                epoch_count INTEGER NOT NULL,
+                sample_count INTEGER NOT NULL,
+                token_delta_total INTEGER NOT NULL,
+                percent_delta REAL NOT NULL,
+                tokens_per_weekly_percent REAL,
+                turns_per_weekly_percent REAL,
+                confidence TEXT NOT NULL,
+                external_usage_observed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (model, reasoning_effort)
+            );
             """
         )
         self._ensure_column("sessions", "reasoning_effort", "TEXT")
@@ -166,6 +182,9 @@ class UsageStore:
         fit_count = self.conn.execute(
             "SELECT COUNT(*) AS value FROM model_effort_fits"
         ).fetchone()["value"]
+        global_fit_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM model_effort_global_fits"
+        ).fetchone()["value"]
         missing_turn_fit_count = self.conn.execute(
             """
             SELECT COUNT(*) AS value
@@ -174,7 +193,7 @@ class UsageStore:
               AND turns_per_weekly_percent IS NULL
             """
         ).fetchone()["value"]
-        if fit_count == 0 or missing_turn_fit_count:
+        if fit_count == 0 or global_fit_count == 0 or missing_turn_fit_count:
             self.rebuild_epochs_and_fits()
 
     def record_sample(
@@ -356,6 +375,8 @@ class UsageStore:
             self.conn.execute("DELETE FROM epochs")
             self.conn.execute("DELETE FROM fits")
             self.conn.execute("DELETE FROM model_effort_fits")
+            self.conn.execute("DELETE FROM model_effort_global_fits")
+            model_effort_groups = []
             resets = [
                 row["weekly_resets_at"]
                 for row in self.conn.execute(
@@ -448,6 +469,7 @@ class UsageStore:
                     (int(external), reset_at),
                 )
                 for group in _model_effort_fit_rows(rows):
+                    model_effort_groups.append(group)
                     self.conn.execute(
                         """
                         INSERT INTO model_effort_fits (
@@ -473,6 +495,32 @@ class UsageStore:
                             utc_now_iso(),
                         ),
                     )
+            for group in _global_model_effort_fit_rows(model_effort_groups):
+                self.conn.execute(
+                    """
+                    INSERT INTO model_effort_global_fits (
+                        model, reasoning_effort, epoch_count, sample_count,
+                        token_delta_total, percent_delta,
+                        tokens_per_weekly_percent, turns_per_weekly_percent,
+                        confidence,
+                        external_usage_observed, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        group["model"],
+                        group["reasoning_effort"],
+                        group["epoch_count"],
+                        group["sample_count"],
+                        group["token_delta_total"],
+                        group["percent_delta"],
+                        group["tokens_per_weekly_percent"],
+                        group["turns_per_weekly_percent"],
+                        group["confidence"],
+                        int(group["external_usage_observed"]),
+                        utc_now_iso(),
+                    ),
+                )
 
     def status(self) -> dict[str, Any]:
         latest = self.conn.execute(
@@ -492,7 +540,9 @@ class UsageStore:
         latest_epoch = None
         latest_fit = None
         latest_model_effort_fit = None
+        latest_model_effort_weekly_fit = None
         model_effort_fits: list[sqlite3.Row] = []
+        model_effort_global_fits: list[sqlite3.Row] = []
         if latest is not None and latest["weekly_resets_at"] is not None:
             latest_epoch = self.conn.execute(
                 "SELECT * FROM epochs WHERE weekly_resets_at = ?",
@@ -503,7 +553,7 @@ class UsageStore:
                 (latest["weekly_resets_at"],),
             ).fetchone()
             latest_key = _model_effort_key(latest)
-            latest_model_effort_fit = self.conn.execute(
+            latest_model_effort_weekly_fit = self.conn.execute(
                 """
                 SELECT *
                 FROM model_effort_fits
@@ -513,6 +563,15 @@ class UsageStore:
                 """,
                 (latest["weekly_resets_at"], latest_key[0], latest_key[1]),
             ).fetchone()
+            latest_model_effort_fit = self.conn.execute(
+                """
+                SELECT *
+                FROM model_effort_global_fits
+                WHERE model = ?
+                  AND reasoning_effort = ?
+                """,
+                latest_key,
+            ).fetchone() or latest_model_effort_weekly_fit
             model_effort_fits = list(
                 self.conn.execute(
                     """
@@ -523,6 +582,16 @@ class UsageStore:
                     LIMIT 5
                     """,
                     (latest["weekly_resets_at"],),
+                )
+            )
+            model_effort_global_fits = list(
+                self.conn.execute(
+                    """
+                    SELECT *
+                    FROM model_effort_global_fits
+                    ORDER BY percent_delta DESC, token_delta_total DESC
+                    LIMIT 5
+                    """
                 )
             )
 
@@ -555,7 +624,13 @@ class UsageStore:
             "latest_epoch": _row_to_dict(latest_epoch),
             "latest_fit": _row_to_dict(latest_fit),
             "latest_model_effort_fit": _row_to_dict(latest_model_effort_fit),
+            "latest_model_effort_weekly_fit": _row_to_dict(
+                latest_model_effort_weekly_fit
+            ),
             "model_effort_fits": [_row_to_dict(row) for row in model_effort_fits],
+            "model_effort_global_fits": [
+                _row_to_dict(row) for row in model_effort_global_fits
+            ],
             "today_usage": self.today_usage(),
         }
 
@@ -599,6 +674,122 @@ class UsageStore:
             else None,
             "sample_count": len(rows),
         }
+
+    def billing_stats(
+        self,
+        billing_day: int,
+        period: str = "current",
+        timezone_name: str | None = None,
+        now: datetime | None = None,
+        debug: bool = False,
+    ) -> dict[str, Any]:
+        if not 1 <= billing_day <= 31:
+            raise ValueError("billing_day must be between 1 and 31")
+        if period not in {"current", "previous"}:
+            raise ValueError("period must be current or previous")
+
+        local_tz = ZoneInfo(timezone_name) if timezone_name else datetime.now().astimezone().tzinfo
+        if local_tz is None:
+            local_tz = timezone.utc
+        local_now = now.astimezone(local_tz) if now is not None else datetime.now(local_tz)
+        current_start = _billing_period_start(local_now, billing_day, local_tz)
+        current_end = _add_billing_month(current_start, billing_day)
+        if period == "previous":
+            period_end = current_start
+            period_start = _add_billing_month(period_end, billing_day, months=-1)
+            label = "Last billing period"
+        else:
+            period_start = current_start
+            period_end = current_end
+            label = "This billing period"
+
+        rows = self._billing_sample_rows(period_end)
+        weekly_windows = _billing_weekly_windows(period_start, period_end)
+        week_metrics = [_empty_metric(window[0], window[1]) for window in weekly_windows]
+        daily_metrics = [
+            [_empty_metric(day_start, min(day_start + timedelta(days=1), week_end))
+             for day_start in _day_starts(week_start, week_end)]
+            for week_start, week_end in weekly_windows
+        ]
+        period_metric = _empty_metric(period_start, period_end)
+        debug_samples = []
+        previous_percent: float | None = None
+
+        for row in rows:
+            observed_utc = _parse_iso_datetime(row["observed_at"])
+            if observed_utc is None:
+                continue
+            observed_local = observed_utc.astimezone(local_tz)
+            current_percent = (
+                float(row["weekly_used_percent"])
+                if row["weekly_used_percent"] is not None
+                else None
+            )
+            movement = 0.0
+            if current_percent is not None and previous_percent is not None:
+                movement = max(0.0, current_percent - previous_percent)
+
+            in_period = period_start <= observed_local < period_end
+            if in_period:
+                token_delta = int(row["token_delta"] or 0)
+                sample = {
+                    "observed_at": observed_local.isoformat(timespec="seconds"),
+                    "usage_percent": current_percent,
+                    "usage_percent_delta": movement,
+                    "token_delta": token_delta,
+                    "session_id": row["session_id"],
+                    "turn_id": row["turn_id"],
+                    "model": row["model"],
+                    "reasoning_effort": row["reasoning_effort"],
+                }
+                _add_sample_to_metric(period_metric, token_delta, movement)
+                for week_index, metric in enumerate(week_metrics):
+                    if metric["start_at"] <= observed_local < metric["end_at"]:
+                        _add_sample_to_metric(metric, token_delta, movement)
+                        for day_metric in daily_metrics[week_index]:
+                            if day_metric["start_at"] <= observed_local < day_metric["end_at"]:
+                                _add_sample_to_metric(day_metric, token_delta, movement)
+                                break
+                        break
+                if debug:
+                    debug_samples.append(sample)
+
+            if current_percent is not None:
+                previous_percent = current_percent
+
+        formatted_weeks = []
+        for metric, days in zip(week_metrics, daily_metrics):
+            week = _format_metric(metric)
+            week["days"] = [_format_metric(day) for day in days]
+            formatted_weeks.append(week)
+
+        output = {
+            "label": label,
+            "period": _format_metric(period_metric),
+            "weekly_windows": formatted_weeks,
+            "billing_day": billing_day,
+            "timezone": str(local_tz),
+        }
+        if debug:
+            output["debug_samples"] = debug_samples
+        return output
+
+    def _billing_sample_rows(self, period_end: datetime) -> list[sqlite3.Row]:
+        end_utc = period_end.astimezone(timezone.utc).isoformat(timespec="seconds")
+        return list(
+            self.conn.execute(
+                """
+                SELECT
+                    observed_at, weekly_used_percent, token_delta, session_id,
+                    turn_id, model, reasoning_effort
+                FROM samples
+                WHERE observed_at < ?
+                  AND parse_error IS NULL
+                ORDER BY observed_at, id
+                """,
+                (end_utc,),
+            )
+        )
 
     def export_jsonl(self) -> str:
         rows = self.conn.execute("SELECT * FROM samples ORDER BY observed_at, id")
@@ -646,6 +837,109 @@ def _normalize_effort(value: Any) -> str | None:
         "extra high": "xhigh",
     }
     return aliases.get(normalized, normalized)
+
+
+def _billing_period_start(
+    local_now: datetime, billing_day: int, local_tz: timezone | ZoneInfo
+) -> datetime:
+    month_start = _billing_month_datetime(
+        local_now.year, local_now.month, billing_day, local_tz
+    )
+    if local_now >= month_start:
+        return month_start
+    return _add_billing_month(month_start, billing_day, months=-1)
+
+
+def _add_billing_month(
+    value: datetime, billing_day: int, months: int = 1
+) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    return _billing_month_datetime(year, month, billing_day, value.tzinfo or timezone.utc)
+
+
+def _billing_month_datetime(
+    year: int, month: int, billing_day: int, local_tz: timezone | ZoneInfo
+) -> datetime:
+    day = min(billing_day, _days_in_month(year, month))
+    return datetime.combine(date(year, month, day), time.min, tzinfo=local_tz)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    return (next_month - timedelta(days=1)).day
+
+
+def _billing_weekly_windows(
+    period_start: datetime, period_end: datetime
+) -> list[tuple[datetime, datetime]]:
+    windows = []
+    start = period_start
+    while start < period_end:
+        end = min(start + timedelta(days=7), period_end)
+        windows.append((start, end))
+        start = end
+    return windows
+
+
+def _day_starts(start: datetime, end: datetime) -> list[datetime]:
+    days = []
+    cursor = start
+    while cursor < end:
+        days.append(cursor)
+        cursor = min(cursor + timedelta(days=1), end)
+    return days
+
+
+def _empty_metric(start: datetime, end: datetime) -> dict[str, Any]:
+    return {
+        "start_at": start,
+        "end_at": end,
+        "usage_percent_delta": 0.0,
+        "token_delta_total": 0,
+        "turn_count": 0,
+        "avg_tokens_per_turn": None,
+    }
+
+
+def _add_sample_to_metric(
+    metric: dict[str, Any], token_delta: int, usage_percent_delta: float
+) -> None:
+    metric["usage_percent_delta"] += usage_percent_delta
+    metric["token_delta_total"] += token_delta
+    metric["turn_count"] += 1
+
+
+def _format_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    turns = int(metric["turn_count"])
+    tokens = int(metric["token_delta_total"])
+    return {
+        "start": metric["start_at"].date().isoformat(),
+        "end": metric["end_at"].date().isoformat(),
+        "start_at": metric["start_at"].isoformat(timespec="seconds"),
+        "end_at": metric["end_at"].isoformat(timespec="seconds"),
+        "usage_percent_delta": float(metric["usage_percent_delta"]),
+        "token_delta_total": tokens,
+        "turn_count": turns,
+        "avg_tokens_per_turn": tokens / turns if turns > 0 else None,
+    }
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _safe_raw(event: dict[str, Any], snapshot: TranscriptSnapshot) -> dict[str, Any]:
@@ -727,6 +1021,54 @@ def _model_effort_fit_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             pending_tokens.clear()
             pending_samples.clear()
         previous_percent = current_percent
+
+    output = []
+    for stat in stats.values():
+        percent_delta = float(stat["percent_delta"])
+        token_total = int(stat["token_delta_total"])
+        stat["tokens_per_weekly_percent"] = (
+            token_total / percent_delta if percent_delta > 0 else None
+        )
+        stat["turns_per_weekly_percent"] = (
+            int(stat["sample_count"]) / percent_delta if percent_delta > 0 else None
+        )
+        stat["confidence"] = _confidence(
+            sample_count=int(stat["sample_count"]),
+            percent_delta=percent_delta,
+            external=bool(stat["external_usage_observed"]),
+        )
+        output.append(stat)
+    return output
+
+
+def _global_model_effort_fit_rows(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for group in groups:
+        key = (group["model"], group["reasoning_effort"])
+        if key not in stats:
+            stats[key] = {
+                "model": key[0],
+                "reasoning_effort": key[1],
+                "epoch_count": 0,
+                "sample_count": 0,
+                "token_delta_total": 0,
+                "percent_delta": 0.0,
+                "external_usage_observed": False,
+            }
+        stat = stats[key]
+        stat["epoch_count"] += 1
+        stat["external_usage_observed"] = bool(
+            stat["external_usage_observed"]
+            or group.get("external_usage_observed")
+        )
+
+        percent_delta = float(group.get("percent_delta") or 0.0)
+        if percent_delta <= 0:
+            continue
+        stat["sample_count"] += int(group.get("sample_count") or 0)
+        stat["token_delta_total"] += int(group.get("token_delta_total") or 0)
+        stat["percent_delta"] += percent_delta
 
     output = []
     for stat in stats.values():

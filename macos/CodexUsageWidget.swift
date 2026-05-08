@@ -27,6 +27,109 @@ private struct SampleRow {
     var parseError: String?
 }
 
+private enum BillingPeriodSelection: Int {
+    case current = 0
+    case previous = 1
+
+    var title: String {
+        switch self {
+        case .current:
+            return "This billing period"
+        case .previous:
+            return "Last billing period"
+        }
+    }
+}
+
+private struct BillingMetricSnapshot {
+    var start: Date
+    var end: Date
+    var usagePercentDelta: Double
+    var tokenDeltaTotal: Int64
+    var turnCount: Int
+
+    var avgTokensPerTurn: Double? {
+        guard turnCount > 0 else { return nil }
+        return Double(tokenDeltaTotal) / Double(turnCount)
+    }
+}
+
+private struct BillingWindowSnapshot {
+    var metric: BillingMetricSnapshot
+    var days: [BillingDaySnapshot]
+}
+
+private struct BillingStatsSnapshot {
+    var label: String
+    var period: BillingMetricSnapshot
+    var windows: [BillingWindowSnapshot]
+}
+
+private struct BillingDaySnapshot {
+    var metric: BillingMetricSnapshot
+    var samples: [BillingSampleDetail]
+}
+
+private struct BillingSampleDetail {
+    var observedAt: Date
+    var weeklyUsedPercent: Double?
+    var usagePercentDelta: Double
+    var tokenDelta: Int64
+    var model: String?
+    var reasoningEffort: String?
+    var turnId: String?
+}
+
+private struct BillingSampleRow {
+    var observedAt: Date
+    var weeklyUsedPercent: Double?
+    var tokenDelta: Int64
+    var model: String?
+    var reasoningEffort: String?
+    var turnId: String?
+}
+
+private struct UsageSettings: Codable {
+    var billingDay: Int
+
+    static let `default` = UsageSettings(billingDay: 12)
+}
+
+private final class SettingsStore {
+    private let path: String
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    init(path: String = "\(NSHomeDirectory())/.codex/usage-monitor/settings.json") {
+        self.path = path
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    }
+
+    func load() -> UsageSettings {
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return .default
+        }
+        guard let decoded = try? decoder.decode(UsageSettings.self, from: data) else {
+            return .default
+        }
+        let day = min(31, max(1, decoded.billingDay))
+        return UsageSettings(billingDay: day)
+    }
+
+    func save(_ settings: UsageSettings) {
+        let day = min(31, max(1, settings.billingDay))
+        let normalized = UsageSettings(billingDay: day)
+        guard let data = try? encoder.encode(normalized) else { return }
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(
+            atPath: dir,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        FileManager.default.createFile(atPath: path, contents: data)
+    }
+}
+
 private final class UsageReader {
     private let dbPath: String
 
@@ -73,6 +176,125 @@ private final class UsageReader {
             todayUsageLevel: today.level,
             sampleCount: sampleCount,
             sessionCount: sessionCount
+        )
+    }
+
+    func billingStats(
+        billingDay: Int,
+        selection: BillingPeriodSelection,
+        now: Date = Date()
+    ) -> BillingStatsSnapshot {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            let empty = BillingMetricSnapshot(
+                start: now,
+                end: now,
+                usagePercentDelta: 0,
+                tokenDeltaTotal: 0,
+                turnCount: 0
+            )
+            return BillingStatsSnapshot(label: selection.title, period: empty, windows: [])
+        }
+        defer { sqlite3_close(db) }
+
+        let clampedDay = min(31, max(1, billingDay))
+        let calendar = calendarInCurrentTimeZone()
+        let currentStart = billingPeriodStart(now: now, billingDay: clampedDay, calendar: calendar)
+        let currentEnd = addBillingMonths(
+            from: currentStart,
+            months: 1,
+            billingDay: clampedDay,
+            calendar: calendar
+        )
+        let periodStart: Date
+        let periodEnd: Date
+        let label: String
+        switch selection {
+        case .current:
+            periodStart = currentStart
+            periodEnd = currentEnd
+            label = BillingPeriodSelection.current.title
+        case .previous:
+            periodEnd = currentStart
+            periodStart = addBillingMonths(
+                from: periodEnd,
+                months: -1,
+                billingDay: clampedDay,
+                calendar: calendar
+            )
+            label = BillingPeriodSelection.previous.title
+        }
+
+        let rows = billingSampleRows(db, endDate: periodEnd)
+        let windowRanges = billingWindowBounds(
+            periodStart: periodStart,
+            periodEnd: periodEnd,
+            calendar: calendar
+        )
+        var periodAccumulator = BillingMetricAccumulator(start: periodStart, end: periodEnd)
+        var windowAccumulators = windowRanges.map { BillingMetricAccumulator(start: $0.start, end: $0.end) }
+        var dayAccumulators = windowRanges.map { bounds in
+            dayBounds(windowStart: bounds.start, windowEnd: bounds.end, calendar: calendar)
+                .map { BillingMetricAccumulator(start: $0.start, end: $0.end) }
+        }
+        var daySamples = dayAccumulators.map { dayArray in
+            dayArray.map { _ in [BillingSampleDetail]() }
+        }
+        var previousPercent: Double?
+
+        for row in rows {
+            let movement: Double
+            if let current = row.weeklyUsedPercent, let previousPercent {
+                movement = max(0, current - previousPercent)
+            } else {
+                movement = 0
+            }
+
+            if periodStart <= row.observedAt && row.observedAt < periodEnd {
+                periodAccumulator.addSample(tokenDelta: row.tokenDelta, usageDelta: movement)
+                for windowIndex in windowAccumulators.indices where windowAccumulators[windowIndex].contains(row.observedAt) {
+                    windowAccumulators[windowIndex].addSample(tokenDelta: row.tokenDelta, usageDelta: movement)
+                    for dayIndex in dayAccumulators[windowIndex].indices where dayAccumulators[windowIndex][dayIndex].contains(row.observedAt) {
+                        dayAccumulators[windowIndex][dayIndex].addSample(
+                            tokenDelta: row.tokenDelta,
+                            usageDelta: movement
+                        )
+                        daySamples[windowIndex][dayIndex].append(
+                            BillingSampleDetail(
+                                observedAt: row.observedAt,
+                                weeklyUsedPercent: row.weeklyUsedPercent,
+                                usagePercentDelta: movement,
+                                tokenDelta: row.tokenDelta,
+                                model: row.model,
+                                reasoningEffort: row.reasoningEffort,
+                                turnId: row.turnId
+                            )
+                        )
+                        break
+                    }
+                    break
+                }
+            }
+            if let current = row.weeklyUsedPercent {
+                previousPercent = current
+            }
+        }
+
+        let windows = windowAccumulators.enumerated().map { index, metric in
+            BillingWindowSnapshot(
+                metric: metric.snapshot(),
+                days: dayAccumulators[index].enumerated().map { dayIndex, dayMetric in
+                    BillingDaySnapshot(
+                        metric: dayMetric.snapshot(),
+                        samples: daySamples[index][dayIndex]
+                    )
+                }
+            )
+        }
+        return BillingStatsSnapshot(
+            label: label,
+            period: periodAccumulator.snapshot(),
+            windows: windows
         )
     }
 
@@ -189,12 +411,26 @@ private final class UsageReader {
 
     private func modelEffortFit(_ db: OpaquePointer?, latest: SampleRow?) -> (turns: Double?, tokens: Double?) {
         guard let latest,
-              let weeklyResetsAt = latest.weeklyResetsAt,
               hasColumn(db, table: "model_effort_fits", column: "turns_per_weekly_percent") else {
             return (nil, nil)
         }
         let model = latest.model ?? "unknown"
         let effort = normalizedEffort(latest.reasoningEffort) ?? "unknown"
+        if hasColumn(db, table: "model_effort_global_fits", column: "turns_per_weekly_percent") {
+            let sql = """
+            SELECT turns_per_weekly_percent, tokens_per_weekly_percent
+            FROM model_effort_global_fits
+            WHERE model = ?
+              AND reasoning_effort = ?
+            LIMIT 1
+            """
+            if let fit = queryModelEffortFit(db, sql: sql, bindings: [model, effort]) {
+                return fit
+            }
+        }
+        guard let weeklyResetsAt = latest.weeklyResetsAt else {
+            return (nil, nil)
+        }
         let sql = """
         SELECT turns_per_weekly_percent, tokens_per_weekly_percent
         FROM model_effort_fits
@@ -203,20 +439,70 @@ private final class UsageReader {
           AND reasoning_effort = ?
         LIMIT 1
         """
+        return queryModelEffortFit(db, sql: sql, int64Binding: weeklyResetsAt, bindings: [model, effort]) ?? (nil, nil)
+    }
+
+    private func queryModelEffortFit(
+        _ db: OpaquePointer?,
+        sql: String,
+        int64Binding: Int64? = nil,
+        bindings: [String]
+    ) -> (turns: Double?, tokens: Double?)? {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            return (nil, nil)
+            return nil
         }
         defer { sqlite3_finalize(statement) }
 
-        sqlite3_bind_int64(statement, 1, weeklyResetsAt)
-        bindText(statement, index: 2, value: model)
-        bindText(statement, index: 3, value: effort)
+        var index: Int32 = 1
+        if let int64Binding {
+            sqlite3_bind_int64(statement, index, int64Binding)
+            index += 1
+        }
+        for value in bindings {
+            bindText(statement, index: index, value: value)
+            index += 1
+        }
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
-            return (nil, nil)
+            return nil
         }
         return (doubleColumn(statement, 0), doubleColumn(statement, 1))
+    }
+
+    private func billingSampleRows(_ db: OpaquePointer?, endDate: Date) -> [BillingSampleRow] {
+        let sql = """
+        SELECT observed_at, weekly_used_percent, token_delta, model, reasoning_effort, turn_id
+        FROM samples
+        WHERE observed_at < ?
+          AND parse_error IS NULL
+        ORDER BY observed_at, id
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, index: 1, value: sqliteUTCString(endDate))
+
+        var rows: [BillingSampleRow] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let observedText = stringColumn(statement, 0),
+                  let observedAt = parseSQLiteTimestamp(observedText) else {
+                continue
+            }
+            rows.append(
+                BillingSampleRow(
+                    observedAt: observedAt,
+                    weeklyUsedPercent: doubleColumn(statement, 1),
+                    tokenDelta: intColumn(statement, 2) ?? 0,
+                    model: stringColumn(statement, 3),
+                    reasoningEffort: stringColumn(statement, 4),
+                    turnId: stringColumn(statement, 5)
+                )
+            )
+        }
+        return rows
     }
 
     private func intScalar(_ db: OpaquePointer?, _ sql: String) -> Int64 {
@@ -247,6 +533,34 @@ private final class UsageReader {
     }
 }
 
+private struct BillingMetricAccumulator {
+    let start: Date
+    let end: Date
+    var usagePercentDelta: Double = 0
+    var tokenDeltaTotal: Int64 = 0
+    var turnCount: Int = 0
+
+    mutating func addSample(tokenDelta: Int64, usageDelta: Double) {
+        usagePercentDelta += usageDelta
+        tokenDeltaTotal += tokenDelta
+        turnCount += 1
+    }
+
+    func contains(_ date: Date) -> Bool {
+        start <= date && date < end
+    }
+
+    func snapshot() -> BillingMetricSnapshot {
+        BillingMetricSnapshot(
+            start: start,
+            end: end,
+            usagePercentDelta: usagePercentDelta,
+            tokenDeltaTotal: tokenDeltaTotal,
+            turnCount: turnCount
+        )
+    }
+}
+
 private final class DragView: NSView {
     override var mouseDownCanMoveWindow: Bool {
         true
@@ -261,6 +575,9 @@ private final class DragLabel: NSTextField {
 
 private final class UsageWindowController: NSObject, NSWindowDelegate {
     private let reader: UsageReader
+    private let settingsStore = SettingsStore()
+    private var settings: UsageSettings
+    private let statsController: StatsWindowController
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let window: NSPanel
     private let expandedSize = NSSize(width: 243, height: 146)
@@ -276,6 +593,7 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
     private let todayCaptionLabel = DragLabel(labelWithString: "Today")
     private let todayLevelLabel = DragLabel(labelWithString: "LOW")
     private let todayValueLabel = DragLabel(labelWithString: "+0.0%")
+    private let statsButton = NSButton(title: "s", target: nil, action: nil)
     private let toggleButton = NSButton(title: "-", target: nil, action: nil)
     private var timer: Timer?
     private var isCompact = false
@@ -288,6 +606,12 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
 
     init(reader: UsageReader) {
         self.reader = reader
+        self.settings = .default
+        self.statsController = StatsWindowController(
+            reader: reader,
+            settingsStore: settingsStore,
+            initialSettings: .default
+        )
         self.window = NSPanel(
             contentRect: NSRect(origin: .zero, size: expandedSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -295,6 +619,8 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         super.init()
+        self.settings = settingsStore.load()
+        self.statsController.updateSettings(settings)
         configureWindow()
         configureStatusMenu()
         configureContent()
@@ -325,6 +651,7 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
         statusItem.button?.title = "Codex --%"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Show Usage", action: #selector(showWindow), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Show Stats", action: #selector(showStats), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Hide Usage", action: #selector(hideWindow), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
@@ -368,6 +695,18 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
         todayBadge.wantsLayer = true
         todayBadge.layer?.cornerRadius = 8
         todayBadge.layer?.masksToBounds = true
+        statsButton.translatesAutoresizingMaskIntoConstraints = false
+        statsButton.wantsLayer = true
+        statsButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
+        statsButton.layer?.cornerRadius = 9
+        statsButton.layer?.masksToBounds = true
+        statsButton.layer?.borderWidth = 0.5
+        statsButton.layer?.borderColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        statsButton.isBordered = false
+        statsButton.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        statsButton.contentTintColor = .black
+        statsButton.target = self
+        statsButton.action = #selector(showStats)
         toggleButton.translatesAutoresizingMaskIntoConstraints = false
         toggleButton.wantsLayer = true
         toggleButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
@@ -402,6 +741,7 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
         window.contentView?.addSubview(root)
         root.addSubview(stack)
         root.addSubview(todayBadge)
+        root.addSubview(statsButton)
         root.addSubview(toggleButton)
         todayBadge.addSubview(todayStack)
         expandedToggleConstraints = [
@@ -444,6 +784,10 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
             detailStack.leadingAnchor.constraint(equalTo: detailPill.leadingAnchor, constant: 7),
             detailStack.trailingAnchor.constraint(equalTo: detailPill.trailingAnchor, constant: -7),
             detailStack.centerYAnchor.constraint(equalTo: detailPill.centerYAnchor),
+            statsButton.centerXAnchor.constraint(equalTo: toggleButton.centerXAnchor),
+            statsButton.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 6),
+            statsButton.widthAnchor.constraint(equalToConstant: 18),
+            statsButton.heightAnchor.constraint(equalToConstant: 18),
             toggleButton.widthAnchor.constraint(equalToConstant: 18),
             toggleButton.heightAnchor.constraint(equalToConstant: 18)
         ])
@@ -560,12 +904,524 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
         window.orderFrontRegardless()
     }
 
+    @objc private func showStats() {
+        statsController.show(anchor: window.frame)
+    }
+
     @objc private func hideWindow() {
         window.orderOut(nil)
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+}
+
+private enum StatsTreeKind {
+    case week
+    case day
+    case sample
+}
+
+private final class StatsTreeNode {
+    let text: String
+    let kind: StatsTreeKind
+    let children: [StatsTreeNode]
+
+    init(text: String, kind: StatsTreeKind, children: [StatsTreeNode] = []) {
+        self.text = text
+        self.kind = kind
+        self.children = children
+    }
+}
+
+private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    private let reader: UsageReader
+    private let settingsStore: SettingsStore
+    private var settings: UsageSettings
+    private let window: NSPanel
+    private var periodSelection: BillingPeriodSelection = .current
+    private let periodThisButton = NSButton(title: "This period", target: nil, action: nil)
+    private let periodLastButton = NSButton(title: "Last period", target: nil, action: nil)
+    private let billingDayField = NSTextField(string: "")
+    private let billingDayStepper = NSStepper()
+    private let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    private let titleLabel = NSTextField(labelWithString: "Billing Stats")
+    private let rangeLabel = NSTextField(labelWithString: "--")
+    private let usageLabel = NSTextField(labelWithString: "Usage: --")
+    private let tokenLabel = NSTextField(labelWithString: "Tokens: --")
+    private let turnLabel = NSTextField(labelWithString: "Turns: --")
+    private let avgLabel = NSTextField(labelWithString: "Avg / turn: --")
+    private let outlineView = NSOutlineView(frame: .zero)
+    private let scrollView = NSScrollView()
+    private var treeRoots: [StatsTreeNode] = []
+    private var collapseOnNextRefresh = true
+    private let statsWindowWidth: CGFloat = 430
+    private let minStatsWindowHeight: CGFloat = 240
+    private let maxStatsWindowHeight: CGFloat = 560
+    private let minOutlineHeight: CGFloat = 70
+
+    init(reader: UsageReader, settingsStore: SettingsStore, initialSettings: UsageSettings) {
+        self.reader = reader
+        self.settingsStore = settingsStore
+        self.settings = initialSettings
+        self.window = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 430, height: 360),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+        configureWindow()
+        configureContent()
+        applySettingsToInputs()
+        applyPeriodButtonStyles()
+    }
+
+    func updateSettings(_ settings: UsageSettings) {
+        self.settings = settings
+        applySettingsToInputs()
+        if window.isVisible {
+            collapseOnNextRefresh = true
+            refresh()
+        }
+    }
+
+    func show(anchor: NSRect? = nil) {
+        collapseOnNextRefresh = true
+        refresh()
+        if let anchor {
+            position(near: anchor)
+        }
+        ensureVisibleFrame()
+        NSApp.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
+        window.makeKey()
+    }
+
+    private func configureWindow() {
+        window.title = "Codex Usage Stats"
+        window.level = .floating
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: statsWindowWidth, height: minStatsWindowHeight)
+        window.maxSize = NSSize(width: statsWindowWidth, height: maxStatsWindowHeight)
+        window.delegate = self
+        if let screen = NSScreen.main {
+            let frame = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: frame.maxX - 450, y: frame.maxY - 560))
+        }
+    }
+
+    private func ensureVisibleFrame() {
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        let current = window.frame
+        let isVisible = visibleFrames.contains { $0.intersects(current) }
+        if !isVisible, let screen = NSScreen.main {
+            let frame = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: frame.maxX - window.frame.width - 30, y: frame.maxY - window.frame.height - 80))
+        }
+    }
+
+    private func position(near anchor: NSRect) {
+        guard let screen = NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var x = anchor.maxX - window.frame.width
+        var y = anchor.minY - 12
+        x = max(visible.minX + 10, min(x, visible.maxX - window.frame.width - 10))
+        y = max(visible.minY + 10, min(y, visible.maxY - window.frame.height - 10))
+        window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func configureContent() {
+        let root = NSView(frame: .zero)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 0.98).cgColor
+        window.contentView = root
+
+        titleLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = .white
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        rangeLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        rangeLabel.textColor = NSColor.white.withAlphaComponent(0.72)
+        rangeLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        configurePeriodButton(periodThisButton, action: #selector(selectThisPeriod))
+        configurePeriodButton(periodLastButton, action: #selector(selectLastPeriod))
+
+        billingDayField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        billingDayField.alignment = .center
+        billingDayField.backgroundColor = NSColor.white.withAlphaComponent(0.95)
+        billingDayField.textColor = .black
+        billingDayField.isBordered = false
+        billingDayField.focusRingType = .none
+        billingDayField.wantsLayer = true
+        billingDayField.layer?.cornerRadius = 6
+        billingDayField.layer?.masksToBounds = true
+        billingDayField.translatesAutoresizingMaskIntoConstraints = false
+
+        billingDayStepper.minValue = 1
+        billingDayStepper.maxValue = 31
+        billingDayStepper.increment = 1
+        billingDayStepper.target = self
+        billingDayStepper.action = #selector(changeBillingDayByStepper)
+        billingDayStepper.translatesAutoresizingMaskIntoConstraints = false
+
+        saveButton.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        saveButton.isBordered = false
+        saveButton.wantsLayer = true
+        saveButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.95).cgColor
+        saveButton.layer?.cornerRadius = 6
+        saveButton.layer?.masksToBounds = true
+        saveButton.contentTintColor = .black
+        saveButton.target = self
+        saveButton.action = #selector(saveBillingDay)
+        saveButton.translatesAutoresizingMaskIntoConstraints = false
+
+        usageLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        tokenLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        turnLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        avgLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        [usageLabel, tokenLabel, turnLabel, avgLabel].forEach { label in
+            label.textColor = NSColor.white.withAlphaComponent(0.9)
+            label.translatesAutoresizingMaskIntoConstraints = false
+        }
+        let summaryStack = NSStackView(views: [usageLabel, tokenLabel, turnLabel, avgLabel])
+        summaryStack.orientation = .vertical
+        summaryStack.alignment = .leading
+        summaryStack.spacing = 3
+        summaryStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("detail"))
+        column.resizingMask = .autoresizingMask
+        outlineView.addTableColumn(column)
+        outlineView.outlineTableColumn = column
+        outlineView.headerView = nil
+        outlineView.selectionHighlightStyle = .none
+        outlineView.rowSizeStyle = .small
+        outlineView.indentationPerLevel = 14
+        outlineView.focusRingType = .none
+        outlineView.usesAlternatingRowBackgroundColors = false
+        outlineView.backgroundColor = NSColor(calibratedWhite: 1.0, alpha: 0.08)
+        outlineView.delegate = self
+        outlineView.dataSource = self
+        outlineView.translatesAutoresizingMaskIntoConstraints = true
+        outlineView.autoresizingMask = [.width]
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.documentView = outlineView
+
+        let billingCaption = NSTextField(labelWithString: "Billing day")
+        billingCaption.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        billingCaption.textColor = NSColor.white.withAlphaComponent(0.72)
+        billingCaption.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(titleLabel)
+        root.addSubview(rangeLabel)
+        root.addSubview(periodThisButton)
+        root.addSubview(periodLastButton)
+        root.addSubview(billingCaption)
+        root.addSubview(billingDayField)
+        root.addSubview(billingDayStepper)
+        root.addSubview(saveButton)
+        root.addSubview(summaryStack)
+        root.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            titleLabel.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            rangeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            rangeLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+
+            periodLastButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            periodLastButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            periodLastButton.widthAnchor.constraint(equalToConstant: 84),
+            periodLastButton.heightAnchor.constraint(equalToConstant: 24),
+            periodThisButton.trailingAnchor.constraint(equalTo: periodLastButton.leadingAnchor, constant: -8),
+            periodThisButton.centerYAnchor.constraint(equalTo: periodLastButton.centerYAnchor),
+            periodThisButton.widthAnchor.constraint(equalToConstant: 84),
+            periodThisButton.heightAnchor.constraint(equalToConstant: 24),
+
+            billingCaption.trailingAnchor.constraint(equalTo: periodLastButton.trailingAnchor),
+            billingCaption.topAnchor.constraint(equalTo: periodLastButton.bottomAnchor, constant: 10),
+            billingDayField.trailingAnchor.constraint(equalTo: billingCaption.trailingAnchor),
+            billingDayField.topAnchor.constraint(equalTo: billingCaption.bottomAnchor, constant: 4),
+            billingDayField.widthAnchor.constraint(equalToConstant: 44),
+            billingDayField.heightAnchor.constraint(equalToConstant: 24),
+            billingDayStepper.trailingAnchor.constraint(equalTo: billingDayField.leadingAnchor, constant: -6),
+            billingDayStepper.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
+            saveButton.trailingAnchor.constraint(equalTo: billingDayStepper.leadingAnchor, constant: -8),
+            saveButton.centerYAnchor.constraint(equalTo: billingDayField.centerYAnchor),
+            saveButton.widthAnchor.constraint(equalToConstant: 44),
+            saveButton.heightAnchor.constraint(equalToConstant: 24),
+
+            summaryStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            summaryStack.topAnchor.constraint(equalTo: rangeLabel.bottomAnchor, constant: 14),
+            summaryStack.trailingAnchor.constraint(lessThanOrEqualTo: saveButton.leadingAnchor, constant: -10),
+
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            scrollView.topAnchor.constraint(equalTo: summaryStack.bottomAnchor, constant: 12),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14)
+        ])
+    }
+
+    private func configurePeriodButton(_ button: NSButton, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 7
+        button.layer?.masksToBounds = true
+        button.layer?.borderWidth = 0.5
+        button.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        button.target = self
+        button.action = action
+    }
+
+    private func applyPeriodButtonStyles() {
+        stylePeriodButton(periodThisButton, selected: periodSelection == .current)
+        stylePeriodButton(periodLastButton, selected: periodSelection == .previous)
+    }
+
+    private func stylePeriodButton(_ button: NSButton, selected: Bool) {
+        if selected {
+            button.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.95).cgColor
+            button.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.95).cgColor
+            button.contentTintColor = .white
+        } else {
+            button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.2).cgColor
+            button.layer?.borderColor = NSColor.white.withAlphaComponent(0.4).cgColor
+            button.contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        }
+    }
+
+    private func applySettingsToInputs() {
+        let day = min(31, max(1, settings.billingDay))
+        billingDayField.stringValue = "\(day)"
+        billingDayStepper.doubleValue = Double(day)
+    }
+
+    private func refresh() {
+        let stats = reader.billingStats(
+            billingDay: settings.billingDay,
+            selection: periodSelection
+        )
+        titleLabel.stringValue = stats.label
+        rangeLabel.stringValue = "\(formatMonthDay(stats.period.start)) - \(formatMonthDay(stats.period.end))"
+        usageLabel.stringValue = "Usage: +\(formatPercentCompact(stats.period.usagePercentDelta))%"
+        tokenLabel.stringValue = "Tokens: \(formatTokenCount(Double(stats.period.tokenDeltaTotal))) tok"
+        turnLabel.stringValue = "Turns: \(stats.period.turnCount)"
+        if let avg = stats.period.avgTokensPerTurn {
+            avgLabel.stringValue = "Avg / turn: \(formatTokenCount(avg)) tok"
+        } else {
+            avgLabel.stringValue = "Avg / turn: --"
+        }
+        treeRoots = buildTree(windows: stats.windows)
+        outlineView.reloadData()
+        if collapseOnNextRefresh {
+            collapseAll()
+            collapseOnNextRefresh = false
+        }
+        syncOutlineDocumentSize()
+        resizeWindowToVisibleRows(animated: window.isVisible)
+    }
+
+    private func buildTree(windows: [BillingWindowSnapshot]) -> [StatsTreeNode] {
+        windows.map { window in
+            let dayChildren = window.days.map { day -> StatsTreeNode in
+                let sampleChildren = day.samples.map { sample in
+                    StatsTreeNode(
+                        text: sampleLine(sample),
+                        kind: .sample
+                    )
+                }
+                return StatsTreeNode(
+                    text: dayLine(day.metric),
+                    kind: .day,
+                    children: sampleChildren
+                )
+            }
+            return StatsTreeNode(
+                text: weekLine(window.metric),
+                kind: .week,
+                children: dayChildren
+            )
+        }
+    }
+
+    private func weekLine(_ metric: BillingMetricSnapshot) -> String {
+        "\(formatMonthDay(metric.start)) - \(formatMonthDay(metric.end))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) turns"
+    }
+
+    private func dayLine(_ metric: BillingMetricSnapshot) -> String {
+        "\(formatMonthDay(metric.start))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) turns"
+    }
+
+    private func sampleLine(_ sample: BillingSampleDetail) -> String {
+        let time = formatHourMinute(sample.observedAt)
+        let usage = sample.weeklyUsedPercent.map { "\(formatPercentCompact($0))%" } ?? "--"
+        let movement = "+\(formatPercentCompact(sample.usagePercentDelta))%"
+        let model = modelDisplayName(sample.model, effort: sample.reasoningEffort)
+        return "\(time)  weekly \(usage)  move \(movement)  \(formatTokenCount(Double(sample.tokenDelta))) tok  \(model)"
+    }
+
+    private func collapseAll() {
+        for root in treeRoots {
+            outlineView.collapseItem(root, collapseChildren: true)
+        }
+    }
+
+    private func syncOutlineDocumentSize() {
+        let width = max(1, scrollView.contentSize.width)
+        let rowHeight = max(14, outlineView.rowHeight + outlineView.intercellSpacing.height)
+        let rowCount = max(1, outlineView.numberOfRows)
+        let height = CGFloat(rowCount) * rowHeight + 2
+
+        var frame = outlineView.frame
+        frame.size.width = width
+        frame.size.height = height
+        outlineView.frame = frame
+
+        var clipOrigin = scrollView.contentView.bounds.origin
+        let maxOriginY = max(0, height - scrollView.contentSize.height)
+        if clipOrigin.y > maxOriginY {
+            clipOrigin.y = maxOriginY
+            scrollView.contentView.scroll(to: clipOrigin)
+        }
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func resizeWindowToVisibleRows(animated: Bool) {
+        guard let root = window.contentView else { return }
+        root.layoutSubtreeIfNeeded()
+        syncOutlineDocumentSize()
+        outlineView.layoutSubtreeIfNeeded()
+
+        let fixedHeight = max(0, root.bounds.height - scrollView.frame.height)
+        let rowHeight = max(14, outlineView.rowHeight + outlineView.intercellSpacing.height)
+        let visibleRowCount = max(1, outlineView.numberOfRows)
+        let idealOutlineHeight = max(minOutlineHeight, CGFloat(visibleRowCount) * rowHeight + 8)
+        let clampedOutlineHeight = min(idealOutlineHeight, maxStatsWindowHeight - fixedHeight)
+        let targetHeight = min(maxStatsWindowHeight, max(minStatsWindowHeight, fixedHeight + clampedOutlineHeight))
+
+        let oldFrame = window.frame
+        if abs(oldFrame.height - targetHeight) < 0.5 {
+            return
+        }
+
+        var newFrame = oldFrame
+        newFrame.size.width = statsWindowWidth
+        newFrame.size.height = targetHeight
+        newFrame.origin.y = oldFrame.maxY - targetHeight
+
+        let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        if let visible {
+            newFrame.origin.x = min(max(newFrame.origin.x, visible.minX + 8), visible.maxX - newFrame.width - 8)
+            newFrame.origin.y = min(max(newFrame.origin.y, visible.minY + 8), visible.maxY - newFrame.height - 8)
+        }
+        window.setFrame(newFrame, display: true, animate: animated)
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        if let node = item as? StatsTreeNode {
+            return node.children.count
+        }
+        return treeRoots.count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        if let node = item as? StatsTreeNode {
+            return node.children[index]
+        }
+        return treeRoots[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        guard let node = item as? StatsTreeNode else { return false }
+        return !node.children.isEmpty
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let node = item as? StatsTreeNode else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("detailCell")
+        let cell: NSTableCellView
+        if let reused = outlineView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = identifier
+            let textField = NSTextField(labelWithString: "")
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            textField.lineBreakMode = .byTruncatingTail
+            cell.addSubview(textField)
+            cell.textField = textField
+            NSLayoutConstraint.activate([
+                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+        }
+        cell.textField?.stringValue = node.text
+        switch node.kind {
+        case .week:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .semibold)
+            cell.textField?.textColor = NSColor.white.withAlphaComponent(0.96)
+        case .day:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+            cell.textField?.textColor = NSColor.white.withAlphaComponent(0.88)
+        case .sample:
+            cell.textField?.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+            cell.textField?.textColor = NSColor.white.withAlphaComponent(0.72)
+        }
+        return cell
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        syncOutlineDocumentSize()
+        resizeWindowToVisibleRows(animated: true)
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        syncOutlineDocumentSize()
+        resizeWindowToVisibleRows(animated: true)
+    }
+
+    @objc private func selectThisPeriod() {
+        periodSelection = .current
+        applyPeriodButtonStyles()
+        collapseOnNextRefresh = true
+        refresh()
+    }
+
+    @objc private func selectLastPeriod() {
+        periodSelection = .previous
+        applyPeriodButtonStyles()
+        collapseOnNextRefresh = true
+        refresh()
+    }
+
+    @objc private func changeBillingDayByStepper() {
+        let day = Int(billingDayStepper.doubleValue.rounded())
+        billingDayField.stringValue = "\(day)"
+    }
+
+    @objc private func saveBillingDay() {
+        let parsed = Int(billingDayField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        let day = min(31, max(1, parsed ?? settings.billingDay))
+        settings.billingDay = day
+        settingsStore.save(settings)
+        applySettingsToInputs()
+        collapseOnNextRefresh = true
+        refresh()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        return
     }
 }
 
@@ -766,6 +1622,140 @@ private func shortTime(_ iso: String?) -> String {
     out.dateStyle = .none
     out.timeStyle = .short
     return out.string(from: date)
+}
+
+private func parseSQLiteTimestamp(_ text: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    if let date = formatter.date(from: text) {
+        return date
+    }
+    return formatter.date(from: text.replacingOccurrences(of: "+00:00", with: "Z"))
+}
+
+private func calendarInCurrentTimeZone() -> Calendar {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone.current
+    return calendar
+}
+
+private func billingPeriodStart(now: Date, billingDay: Int, calendar: Calendar) -> Date {
+    let components = calendar.dateComponents([.year, .month], from: now)
+    guard let year = components.year, let month = components.month else {
+        return calendar.startOfDay(for: now)
+    }
+    let currentMonthStart = billingMonthStart(
+        year: year,
+        month: month,
+        billingDay: billingDay,
+        calendar: calendar
+    )
+    if now >= currentMonthStart {
+        return currentMonthStart
+    }
+    return addBillingMonths(
+        from: currentMonthStart,
+        months: -1,
+        billingDay: billingDay,
+        calendar: calendar
+    )
+}
+
+private func addBillingMonths(
+    from date: Date,
+    months: Int,
+    billingDay: Int,
+    calendar: Calendar
+) -> Date {
+    guard let shifted = calendar.date(byAdding: .month, value: months, to: date) else {
+        return date
+    }
+    let components = calendar.dateComponents([.year, .month], from: shifted)
+    guard let year = components.year, let month = components.month else {
+        return shifted
+    }
+    return billingMonthStart(year: year, month: month, billingDay: billingDay, calendar: calendar)
+}
+
+private func billingMonthStart(
+    year: Int,
+    month: Int,
+    billingDay: Int,
+    calendar: Calendar
+) -> Date {
+    let day = min(billingDay, daysInMonth(year: year, month: month, calendar: calendar))
+    let components = DateComponents(
+        timeZone: calendar.timeZone,
+        year: year,
+        month: month,
+        day: day
+    )
+    return calendar.date(from: components) ?? Date()
+}
+
+private func daysInMonth(year: Int, month: Int, calendar: Calendar) -> Int {
+    var components = DateComponents()
+    components.year = year
+    components.month = month
+    components.day = 1
+    let first = calendar.date(from: components) ?? Date()
+    let range = calendar.range(of: .day, in: .month, for: first)
+    return range?.count ?? 31
+}
+
+private func billingWindowBounds(
+    periodStart: Date,
+    periodEnd: Date,
+    calendar: Calendar
+) -> [(start: Date, end: Date)] {
+    var cursor = periodStart
+    var windows: [(start: Date, end: Date)] = []
+    while cursor < periodEnd {
+        let candidate = calendar.date(byAdding: .day, value: 7, to: cursor) ?? periodEnd
+        let end = min(candidate, periodEnd)
+        windows.append((start: cursor, end: end))
+        cursor = end
+    }
+    return windows
+}
+
+private func dayBounds(
+    windowStart: Date,
+    windowEnd: Date,
+    calendar: Calendar
+) -> [(start: Date, end: Date)] {
+    var cursor = windowStart
+    var days: [(start: Date, end: Date)] = []
+    while cursor < windowEnd {
+        let candidate = calendar.date(byAdding: .day, value: 1, to: cursor) ?? windowEnd
+        let end = min(candidate, windowEnd)
+        days.append((start: cursor, end: end))
+        cursor = end
+    }
+    return days
+}
+
+private func formatMonthDay(_ value: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "MMM d"
+    return formatter.string(from: value)
+}
+
+private func formatHourMinute(_ value: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "HH:mm"
+    return formatter.string(from: value)
+}
+
+private func formatPercentCompact(_ value: Double) -> String {
+    if value.rounded() == value {
+        return "\(Int(value))"
+    }
+    return String(format: "%.1f", value)
 }
 
 let app = NSApplication.shared

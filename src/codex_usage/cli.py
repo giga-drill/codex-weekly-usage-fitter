@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_daemon(home, args)
     if args.command == "status":
         return _cmd_status(home, args)
+    if args.command == "billing-stats":
+        return _cmd_billing_stats(home, args)
     if args.command == "export":
         return _cmd_export(home, args)
     if args.command == "hook-config":
@@ -56,6 +58,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show current weekly usage fit")
     status.add_argument("--json", action="store_true", help="print JSON")
+
+    billing = sub.add_parser(
+        "billing-stats",
+        help="show token and usage stats for a billing period",
+    )
+    billing.add_argument(
+        "--billing-day",
+        type=int,
+        required=True,
+        help="day of month when the ChatGPT subscription renews",
+    )
+    billing.add_argument(
+        "--period",
+        choices=("current", "previous"),
+        default="current",
+        help="billing period to report",
+    )
+    billing.add_argument(
+        "--timezone",
+        default=None,
+        help="IANA timezone for billing boundaries; defaults to local timezone",
+    )
+    billing.add_argument("--debug", action="store_true", help="print sample ledger")
+    billing.add_argument("--json", action="store_true", help="print JSON")
 
     export = sub.add_parser("export", help="export raw samples")
     export.add_argument(
@@ -105,6 +131,26 @@ def _cmd_status(home: Path, args: argparse.Namespace) -> int:
         return 0
 
     print(_format_status(status))
+    return 0
+
+
+def _cmd_billing_stats(home: Path, args: argparse.Namespace) -> int:
+    store = UsageStore(home)
+    try:
+        stats = store.billing_stats(
+            billing_day=args.billing_day,
+            period=args.period,
+            timezone_name=args.timezone,
+            debug=args.debug,
+        )
+    finally:
+        store.close()
+
+    if args.json:
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return 0
+
+    print(_format_billing_stats(stats, debug=args.debug))
     return 0
 
 
@@ -226,6 +272,60 @@ def _format_status(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
+    period = stats["period"]
+    lines = [stats["label"]]
+    lines.append(
+        f"{_format_period_date(period['start'])} - {_format_period_date(period['end'])} "
+        f"{stats['timezone']}"
+    )
+    lines.append("")
+    lines.append("Summary")
+    lines.append(f"Usage: +{period['usage_percent_delta']:.3g}%")
+    lines.append(f"Tokens: {_format_token_count(period['token_delta_total'])}")
+    lines.append(f"Turns: {period['turn_count']}")
+    lines.append(
+        "Avg / turn: "
+        + (
+            _format_token_count(period["avg_tokens_per_turn"])
+            if period["avg_tokens_per_turn"] is not None
+            else "--"
+        )
+    )
+    lines.append("")
+    lines.append("Weekly windows")
+    for window in stats["weekly_windows"]:
+        lines.append(
+            f"{_format_period_date(window['start'])} - "
+            f"{_format_period_date(window['end'])}   "
+            f"+{window['usage_percent_delta']:.3g}%   "
+            f"{_format_token_count(window['token_delta_total'])}   "
+            f"{window['turn_count']} turns"
+        )
+        for day in window["days"]:
+            lines.append(
+                f"  {_format_period_date(day['start']):<6}   "
+                f"+{day['usage_percent_delta']:.3g}%   "
+                f"{_format_token_count(day['token_delta_total']):>9}   "
+                f"{day['turn_count']} turns"
+            )
+    if debug:
+        lines.append("")
+        lines.append("Samples used")
+        for sample in stats.get("debug_samples", []):
+            usage = sample["usage_percent"]
+            usage_text = f"{usage:.3g}%" if usage is not None else "--"
+            model = sample.get("model") or "-"
+            effort = sample.get("reasoning_effort") or "-"
+            lines.append(
+                f"{sample['observed_at']}  weekly={usage_text:<6} "
+                f"move=+{sample['usage_percent_delta']:.3g}% "
+                f"delta={_format_token_count(sample['token_delta']):>9} "
+                f"model={model}/{effort} turn={sample.get('turn_id') or '-'}"
+            )
+    return "\n".join(lines)
+
+
 def _format_model_effort_fit(fit: dict[str, Any]) -> str:
     label = f"{fit.get('model') or 'unknown'}/{fit.get('reasoning_effort') or 'unknown'}"
     tpp = fit.get("tokens_per_weekly_percent")
@@ -251,3 +351,23 @@ def _format_epoch_time(value: Any) -> str:
     except (TypeError, ValueError):
         return "unknown"
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
+
+
+def _format_period_date(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%b %d")
+
+
+def _format_token_count(value: Any) -> str:
+    if value is None:
+        return "--"
+    count = float(value)
+    abs_count = abs(count)
+    if abs_count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M tok"
+    if abs_count >= 1_000:
+        return f"{count / 1_000:.1f}k tok"
+    return f"{count:.0f} tok"
