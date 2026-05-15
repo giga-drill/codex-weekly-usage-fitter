@@ -85,6 +85,7 @@ private struct BillingSampleDetail {
 private struct BillingSampleRow {
     var observedAt: Date
     var weeklyUsedPercent: Double?
+    var usagePercentDelta: Double
     var tokenDelta: Int64
     var model: String?
     var reasoningEffort: String?
@@ -183,9 +184,26 @@ private final class UsageReader {
         }
         defer { sqlite3_close(db) }
 
-        let sampleCount = intScalar(db, "SELECT COUNT(*) FROM samples")
+        let sampleCount = intScalar(
+            db,
+            "SELECT COUNT(*) FROM conversation_turns WHERE completed = 1"
+        )
+        let rawSampleCount = intScalar(db, "SELECT COUNT(*) FROM samples")
         let sessionCount = intScalar(db, "SELECT COUNT(*) FROM sessions")
-        let rows = latestSamples(db)
+        var rows = latestSamples(db)
+        if rows.isEmpty, rawSampleCount > 0 {
+            rows = [
+                SampleRow(
+                    weeklyPercent: nil,
+                    turnTokens: nil,
+                    latestSampleAt: nil,
+                    model: nil,
+                    reasoningEffort: nil,
+                    weeklyResetsAt: nil,
+                    parseError: "conversation turns unavailable"
+                )
+            ]
+        }
         let latest = rows.first
         let today = todayUsage(db)
         let fit = modelEffortFit(db, latest: latest)
@@ -272,15 +290,9 @@ private final class UsageReader {
         var daySamples = dayAccumulators.map { dayArray in
             dayArray.map { _ in [BillingSampleDetail]() }
         }
-        var previousPercent: Double?
 
         for row in rows {
-            let movement: Double
-            if let current = row.weeklyUsedPercent, let previousPercent {
-                movement = max(0, current - previousPercent)
-            } else {
-                movement = 0
-            }
+            let movement = max(0, row.usagePercentDelta)
 
             if periodStart <= row.observedAt && row.observedAt < periodEnd {
                 periodAccumulator.addSample(tokenDelta: row.tokenDelta, usageDelta: movement)
@@ -306,9 +318,6 @@ private final class UsageReader {
                     }
                     break
                 }
-            }
-            if let current = row.weeklyUsedPercent {
-                previousPercent = current
             }
         }
 
@@ -339,53 +348,44 @@ private final class UsageReader {
     }
 
     private func latestSamples(_ db: OpaquePointer?) -> [SampleRow] {
-        let effortColumn = hasColumn(db, table: "samples", column: "reasoning_effort")
+        let effortColumn = hasColumn(db, table: "conversation_turns", column: "reasoning_effort")
             ? "reasoning_effort"
             : "NULL AS reasoning_effort"
         let usableSql = """
-        SELECT weekly_used_percent, token_delta, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
-        FROM samples
-        WHERE parse_error IS NULL
-          AND weekly_used_percent IS NOT NULL
-        ORDER BY id DESC
+        SELECT
+            weekly_used_percent_end AS weekly_percent,
+            token_delta,
+            end_observed_at AS observed_at,
+            model,
+            \(effortColumn),
+            weekly_resets_at
+        FROM conversation_turns
+        WHERE completed = 1
+          AND weekly_used_percent_end IS NOT NULL
+        ORDER BY end_observed_at DESC, id DESC
         LIMIT 1
         """
         let fallbackSql = """
-        SELECT weekly_used_percent, token_delta, observed_at, model, \(effortColumn), weekly_resets_at, parse_error
-        FROM samples
-        ORDER BY id DESC
+        SELECT
+            weekly_used_percent_end AS weekly_percent,
+            token_delta,
+            end_observed_at AS observed_at,
+            model,
+            \(effortColumn),
+            weekly_resets_at
+        FROM conversation_turns
+        WHERE completed = 1
+        ORDER BY end_observed_at DESC, id DESC
         LIMIT 1
         """
-        guard let rows = sampleRows(db, sql: usableSql) else {
-            return [
-                SampleRow(
-                    weeklyPercent: nil,
-                    turnTokens: nil,
-                    latestSampleAt: nil,
-                    model: nil,
-                    reasoningEffort: nil,
-                    weeklyResetsAt: nil,
-                    parseError: sqliteMessage(db)
-                )
-            ]
-        }
+        guard let rows = sampleRows(db, sql: usableSql) else { return [] }
         if !rows.isEmpty {
             return rows
         }
         if let fallbackRows = sampleRows(db, sql: fallbackSql) {
             return fallbackRows
         }
-        return [
-            SampleRow(
-                weeklyPercent: nil,
-                turnTokens: nil,
-                latestSampleAt: nil,
-                model: nil,
-                reasoningEffort: nil,
-                weeklyResetsAt: nil,
-                parseError: sqliteMessage(db)
-            )
-        ]
+        return []
     }
 
     private func sampleRows(_ db: OpaquePointer?, sql: String) -> [SampleRow]? {
@@ -405,7 +405,7 @@ private final class UsageReader {
                     model: stringColumn(statement, 3),
                     reasoningEffort: stringColumn(statement, 4),
                     weeklyResetsAt: intColumn(statement, 5),
-                    parseError: stringColumn(statement, 6)
+                    parseError: nil
                 )
             )
         }
@@ -415,13 +415,13 @@ private final class UsageReader {
     private func todayUsage(_ db: OpaquePointer?) -> (percent: Double?, level: String) {
         let bounds = todayBounds()
         let sql = """
-        SELECT weekly_used_percent
-        FROM samples
-        WHERE observed_at >= ?
-          AND observed_at < ?
-          AND weekly_used_percent IS NOT NULL
-          AND parse_error IS NULL
-        ORDER BY observed_at, id
+        SELECT
+            COALESCE(SUM(weekly_percent_delta), 0),
+            COUNT(*)
+        FROM conversation_turns
+        WHERE completed = 1
+          AND end_observed_at >= ?
+          AND end_observed_at < ?
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -432,20 +432,14 @@ private final class UsageReader {
         bindText(statement, index: 1, value: bounds.start)
         bindText(statement, index: 2, value: bounds.end)
 
-        var firstPercent: Double?
-        var lastPercent: Double?
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let percent = sqlite3_column_double(statement, 0)
-            if firstPercent == nil {
-                firstPercent = percent
-            }
-            lastPercent = percent
-        }
-
-        guard let firstPercent, let lastPercent else {
+        guard sqlite3_step(statement) == SQLITE_ROW else {
             return (nil, "low")
         }
-        let percent = max(0, lastPercent - firstPercent)
+        let turnCount = sqlite3_column_int64(statement, 1)
+        guard turnCount > 0 else {
+            return (nil, "low")
+        }
+        let percent = sqlite3_column_double(statement, 0)
         return (percent, todayUsageLevel(percent))
     }
 
@@ -512,11 +506,18 @@ private final class UsageReader {
 
     private func billingSampleRows(_ db: OpaquePointer?, endDate: Date) -> [BillingSampleRow] {
         let sql = """
-        SELECT observed_at, weekly_used_percent, token_delta, model, reasoning_effort, turn_id
-        FROM samples
-        WHERE observed_at < ?
-          AND parse_error IS NULL
-        ORDER BY observed_at, id
+        SELECT
+            end_observed_at,
+            weekly_used_percent_end,
+            weekly_percent_delta,
+            token_delta,
+            model,
+            reasoning_effort,
+            last_internal_turn_id
+        FROM conversation_turns
+        WHERE completed = 1
+          AND end_observed_at < ?
+        ORDER BY end_observed_at, id
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -535,10 +536,11 @@ private final class UsageReader {
                 BillingSampleRow(
                     observedAt: observedAt,
                     weeklyUsedPercent: doubleColumn(statement, 1),
-                    tokenDelta: intColumn(statement, 2) ?? 0,
-                    model: stringColumn(statement, 3),
-                    reasoningEffort: stringColumn(statement, 4),
-                    turnId: stringColumn(statement, 5)
+                    usagePercentDelta: doubleColumn(statement, 2) ?? 0,
+                    tokenDelta: intColumn(statement, 3) ?? 0,
+                    model: stringColumn(statement, 4),
+                    reasoningEffort: stringColumn(statement, 5),
+                    turnId: stringColumn(statement, 6)
                 )
             )
         }
@@ -797,8 +799,8 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
     private let titleLabel = DragLabel(labelWithString: "This week")
     private let weeklyLabel = DragLabel(labelWithString: "--%")
     private let detailPill = DragView()
-    private let transitionLabel = DragLabel(labelWithString: "1% ~= -- turns / -- tok")
-    private let turnLabel = DragLabel(labelWithString: "Last turn -- tokens")
+    private let transitionLabel = DragLabel(labelWithString: "1% ~= -- conversations / -- tok")
+    private let turnLabel = DragLabel(labelWithString: "Last conversation -- tokens")
     private let metaLabel = DragLabel(labelWithString: "")
     private let todayBadge = DragView()
     private let todayCaptionLabel = DragLabel(labelWithString: "Today")
@@ -1019,15 +1021,15 @@ private final class UsageWindowController: NSObject, NSWindowDelegate {
             transitionLabel.stringValue = "Parse issue"
             turnLabel.stringValue = error
         } else if snapshot.sampleCount == 0 {
-            transitionLabel.stringValue = "1% ~= -- turns / -- tok"
-            turnLabel.stringValue = "Waiting for first sample"
+            transitionLabel.stringValue = "1% ~= -- conversations / -- tok"
+            turnLabel.stringValue = "Waiting for first conversation"
         } else {
             transitionLabel.stringValue = formatFitLine(
                 turns: snapshot.fitTurnsPerPercent,
                 tokens: snapshot.fitTokensPerPercent
             )
             let turnTokens = formatTokens(snapshot.turnTokens)
-            turnLabel.stringValue = "Last turn \(turnTokens) tokens"
+            turnLabel.stringValue = "Last conversation \(turnTokens) tokens"
         }
 
         let model = modelDisplayName(snapshot.model, effort: snapshot.reasoningEffort)
@@ -1164,8 +1166,8 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     private let rangeLabel = NSTextField(labelWithString: "--")
     private let usageLabel = NSTextField(labelWithString: "Usage: --")
     private let tokenLabel = NSTextField(labelWithString: "Tokens: --")
-    private let turnLabel = NSTextField(labelWithString: "Turns: --")
-    private let avgLabel = NSTextField(labelWithString: "Avg / turn: --")
+    private let turnLabel = NSTextField(labelWithString: "Conversations: --")
+    private let avgLabel = NSTextField(labelWithString: "Avg / conversation: --")
     private let cleanFitLabel = NSTextField(labelWithString: "Clean 1%: --")
     private let mixedLabel = NSTextField(labelWithString: "Mixed: --")
     private let outlineView = NSOutlineView(frame: .zero)
@@ -1452,16 +1454,16 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
         rangeLabel.stringValue = "\(formatMonthDay(stats.period.start)) - \(formatMonthDay(stats.period.end))"
         usageLabel.stringValue = "Usage: +\(formatPercentCompact(stats.period.usagePercentDelta))%"
         tokenLabel.stringValue = "Tokens: \(formatTokenCount(Double(stats.period.tokenDeltaTotal))) tok"
-        turnLabel.stringValue = "Turns: \(stats.period.turnCount)"
+        turnLabel.stringValue = "Conversations: \(stats.period.turnCount)"
         if let avg = stats.period.avgTokensPerTurn {
-            avgLabel.stringValue = "Avg / turn: \(formatTokenCount(avg)) tok"
+            avgLabel.stringValue = "Avg / conversation: \(formatTokenCount(avg)) tok"
         } else {
-            avgLabel.stringValue = "Avg / turn: --"
+            avgLabel.stringValue = "Avg / conversation: --"
         }
         let modelText = modelDisplayName(latestSnapshot.model, effort: latestSnapshot.reasoningEffort)
         if let turns = latestSnapshot.fitTurnsPerPercent,
            let tokens = latestSnapshot.fitTokensPerPercent {
-            cleanFitLabel.stringValue = "Clean 1% (\(modelText)): \(formatTurns(turns)) turns / \(formatTokenCount(tokens)) tok"
+            cleanFitLabel.stringValue = "Clean 1% (\(modelText)): \(formatTurns(turns)) conversations / \(formatTokenCount(tokens)) tok"
         } else {
             cleanFitLabel.stringValue = "Clean 1% (\(modelText)): waiting for clean movement"
         }
@@ -1530,7 +1532,7 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
             let totalTurns = stats.mixedCombinations.reduce(0) { $0 + $1.turnCount }
             roots.append(
                 StatsTreeNode(
-                    text: "Mixed movement observations   +\(formatPercentCompact(totalPercent))%   \(formatTokenCount(Double(totalTokens))) tok   \(totalTurns) turns",
+                    text: "Mixed movement observations   +\(formatPercentCompact(totalPercent))%   \(formatTokenCount(Double(totalTokens))) tok   \(totalTurns) conv",
                     kind: .mixedSection,
                     children: mixedCombinationNodes
                 )
@@ -1540,11 +1542,11 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     }
 
     private func weekLine(_ metric: BillingMetricSnapshot) -> String {
-        "\(formatMonthDay(metric.start)) - \(formatMonthDay(metric.end))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) turns"
+        "\(formatMonthDay(metric.start)) - \(formatMonthDay(metric.end))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) conv"
     }
 
     private func dayLine(_ metric: BillingMetricSnapshot) -> String {
-        "\(formatMonthDay(metric.start))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) turns"
+        "\(formatMonthDay(metric.start))   +\(formatPercentCompact(metric.usagePercentDelta))%   \(formatTokenCount(Double(metric.tokenDeltaTotal))) tok   \(metric.turnCount) conv"
     }
 
     private func sampleLine(_ sample: BillingSampleDetail) -> String {
@@ -1555,12 +1557,12 @@ private final class StatsWindowController: NSObject, NSWindowDelegate, NSOutline
     }
 
     private func mixedCombinationLine(_ combination: BillingMixedMovementCombination) -> String {
-        "\(combination.combination)   \(combination.eventCount)x   +\(formatPercentCompact(combination.percentDelta))%   \(formatTokenCount(Double(combination.tokenDeltaTotal))) tok   \(combination.turnCount) turns"
+        "\(combination.combination)   \(combination.eventCount)x   +\(formatPercentCompact(combination.percentDelta))%   \(formatTokenCount(Double(combination.tokenDeltaTotal))) tok   \(combination.turnCount) conv"
     }
 
     private func mixedEventLine(_ event: BillingMixedMovementEvent) -> String {
         let at = formatMonthDay(event.observedAt) + " " + formatHourMinute(event.observedAt)
-        return "\(at)   +\(formatPercentCompact(event.percentDelta))%   \(formatTokenCount(Double(event.tokenDeltaTotal))) tok   \(event.turnCount) turns"
+        return "\(at)   +\(formatPercentCompact(event.percentDelta))%   \(formatTokenCount(Double(event.tokenDeltaTotal))) tok   \(event.turnCount) conv"
     }
 
     private func collapseAll() {
@@ -1798,9 +1800,9 @@ private func formatTokenCount(_ value: Double) -> String {
 
 private func formatFitLine(turns: Double?, tokens: Double?) -> String {
     guard let turns, let tokens else {
-        return "1% ~= -- turns / -- tok"
+        return "1% ~= -- conversations / -- tok"
     }
-    return "1% ~= \(formatTurns(turns)) turns / \(formatTokenCount(tokens)) tok"
+    return "1% ~= \(formatTurns(turns)) conversations / \(formatTokenCount(tokens)) tok"
 }
 
 private func formatTurns(_ value: Double) -> String {

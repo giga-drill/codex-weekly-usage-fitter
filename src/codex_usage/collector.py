@@ -269,17 +269,24 @@ def _transcript_turns(path: Path) -> list[TranscriptTurn]:
     turns: list[TranscriptTurn] = []
     active_turn: dict[str, Any] | None = None
     active_has_token_count = False
+    active_has_task_complete = False
 
-    def finish_turn() -> None:
-        nonlocal active_turn, active_has_token_count
-        if not active_turn or not active_has_token_count:
+    def finish_turn(*, boundary: bool = False) -> None:
+        nonlocal active_turn, active_has_token_count, active_has_task_complete
+        if (
+            not active_turn
+            or not active_has_token_count
+            or (not boundary and not active_has_task_complete)
+        ):
             active_turn = None
             active_has_token_count = False
+            active_has_task_complete = False
             return
         turn_id = _string_or_none(active_turn.get("turn_id"))
         if session_id is not None and turn_id is not None and turn_id < session_id:
             active_turn = None
             active_has_token_count = False
+            active_has_task_complete = False
             return
         turns.append(
             TranscriptTurn(
@@ -293,6 +300,7 @@ def _transcript_turns(path: Path) -> list[TranscriptTurn]:
         )
         active_turn = None
         active_has_token_count = False
+        active_has_task_complete = False
 
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -313,15 +321,18 @@ def _transcript_turns(path: Path) -> list[TranscriptTurn]:
                         cwd = _string_or_none(payload.get("cwd"))
                     continue
                 if envelope.get("type") == "turn_context" and isinstance(payload, dict):
-                    finish_turn()
+                    finish_turn(boundary=True)
                     active_turn = payload
                     active_has_token_count = False
+                    active_has_task_complete = False
                     continue
                 if envelope.get("type") != "event_msg" or not isinstance(payload, dict):
                     continue
                 if payload.get("type") in {"token_count", "TokenCount"}:
                     active_has_token_count = True
-        finish_turn()
+                if payload.get("type") == "task_complete":
+                    active_has_task_complete = True
+        finish_turn(boundary=False)
     except OSError:
         return []
 

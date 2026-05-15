@@ -1,6 +1,6 @@
 # Codex Usage Handoff
 
-Last updated: 2026-05-08
+Last updated: 2026-05-09
 
 This is the short handoff entrypoint for planner and executor sessions.
 `AGENTS.md` stays tiny because Codex auto-loads it. Read this file first, then
@@ -12,16 +12,17 @@ open the linked docs only when the current task needs them.
 2. This `docs.md` for current state and next actions.
 3. `docs/decisions.md` when changing product semantics, fit logic, token
    accounting, turn counting, or widget/stat output.
-4. `docs/usage-profiler-plan.md` when implementing the usage profiler.
-5. `docs/history.md` only when you need completed execution details.
+4. `docs/conversation-turn-fix-plan.md` before changing turn/count semantics.
+5. `docs/usage-profiler-plan.md` when implementing the usage profiler.
+6. `docs/history.md` only when you need completed execution details.
 
 ## Project Summary
 
 This repo builds Codex Weekly Usage Fitter, a local Codex usage monitor.
 
 It records token usage from local Codex conversations, observes Codex weekly
-usage percentage samples, and estimates how many tokens or user-visible turns
-correspond to 1% of weekly usage.
+usage percentage samples, and estimates tokens or completed conversation turns
+per 1% of weekly usage.
 
 The project is local-first:
 
@@ -42,22 +43,37 @@ Public repo: `https://github.com/giga-drill/codex-weekly-usage-fitter`
 
 ## Current Status
 
-Executor has implemented the major semantic work:
+Conversation-turn migration blockers from planner review are now fixed:
 
-- backend movement-event attribution;
-- clean-only model/effort fits;
-- mixed movement observations;
-- macOS stats panel mixed-observation display;
-- user-visible token delta policy;
-- turn count estimation policy.
+- `weekly_percent_delta` for `conversation_turns` is now computed against
+  global weekly usage progression (by reset window), not per-session;
+- top-level epoch/fit rebuild prefers `conversation_turns` and falls back to
+  raw `samples` only when aggregate turns are unavailable;
+- init/backfill order now ensures `conversation_turns` before fit/movement
+  rebuild checks, so reopening an old DB backfills and rebuilds dependents;
+- transcript conversation-turn parsing now exposes internal-turn token delta
+  breakdown (`internal_token_deltas`) for reconciliation.
+- opening an existing DB now detects stale `conversation_turns` rows (for
+  example missing `internal_token_deltas_json`, token-delta mismatch, or
+  legacy weekly percent deltas) and triggers a full rebuild of
+  `conversation_turns` plus dependent epochs/fits/movement events.
+- weekly movement now uses reset-window high-water accounting consistently for
+  both stored `conversation_turns.weekly_percent_delta` and
+  `usage_movement_events`.
+- `conversation_turns.token_delta` now follows the sum of internal turn deltas
+  (including the first completed conversation turn), instead of forcing the
+  first turn to zero.
 
-Latest known validation from executor:
+CLI status raw row is now clearly labeled as internal:
+`Latest raw sample (internal) ...`.
+
+Latest validation state:
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Executor reported 27 passing tests after the turn-count audit.
+Current result: 38 passing tests.
 
 ## Active Notes
 
@@ -81,9 +97,11 @@ Hook runtime note:
 Product semantics to preserve:
 
 - User-visible token consumption uses `token_delta`, not `last_total_tokens`.
-- A user-visible turn is a positive sample-to-sample `token_delta` interval.
+- User-visible turn/count language should become `conversation turn`.
 - Mixed model/effort usage movement is reported as a combination, not split by
   token share.
+- `samples` remains the raw observation layer; `conversation_turns` is the
+  user-facing aggregate layer in progress.
 
 See `docs/decisions.md` for the full stable rules.
 
@@ -102,9 +120,13 @@ open "build/Codex Usage.app"
 
 ## Next Executor Checklist
 
-1. For profiler work, read `docs/usage-profiler-plan.md`.
-2. Before semantic edits, read `docs/decisions.md`.
-3. Preserve the token delta and turn-count semantics in all user-visible output.
+1. Verify live widget behavior after restart:
+   compact/expanded view plus stats panel values should match
+   `conversation_turns`-based CLI output.
+2. Continue compatibility cleanup in CLI/JSON naming:
+   keep aliases but prefer explicit `conversation_turn_*` keys.
+3. Review mixed-movement zero-token events from real data and decide whether
+   they should be surfaced, filtered, or marked as external-only.
 4. If touching widget behavior, rebuild and restart the running app before
    judging the UI.
 5. Run the Python test suite after backend changes.

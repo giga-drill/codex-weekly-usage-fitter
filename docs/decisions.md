@@ -10,10 +10,10 @@ auto-loaded by Codex; read it when changing semantics or user-visible behavior.
 Every user-visible token-consumption number should use the `token_delta`
 concept.
 
-Definition:
+Raw observation definition:
 
 ```text
-Last turn tokens = samples.token_delta
+sample token delta = samples.token_delta
 ```
 
 Meaning:
@@ -28,8 +28,10 @@ Meaning:
 
 Rules:
 
-- Use `token_delta` for every visible "last turn", sample-row token value,
-  billing row token value, and token-per-turn calculation.
+- Raw sample rows should use `token_delta` when displaying sample-level token
+  values.
+- Completed conversation-turn rows should aggregate raw `token_delta` samples
+  according to `docs/conversation-turn-fix-plan.md`.
 - Do not show `last_total_tokens` or `last_*_tokens` in normal UI, CLI status,
   stats panels, or public status JSON.
 - `last_total_tokens` may remain as an internal raw stored field for debugging
@@ -38,53 +40,59 @@ Rules:
 
 Operational caveats:
 
-- If the Stop hook fires after every Codex turn, `token_delta` represents one
-  complete turn.
-- If samples are missed, `token_delta` can cover more than one turn. It is still
-  the best user-facing number because it reflects the observed sample-to-sample
-  consumption interval.
+- `token_delta` is a raw sample-to-sample interval. It may be an intermediate
+  step inside a conversation turn.
+- If samples are missed, `token_delta` can cover more than one internal event.
 - The first observed sample for a session is a baseline with `token_delta = 0`;
-  it is not a completed turn.
+  it is not a completed conversation turn.
 
-## Turn Count Policy
+## Conversation Turn Policy
 
-A user-visible turn is a positive sample-to-sample token delta interval.
+User-visible accounting should use `conversation turn`, not bare `turn`.
 
 Definition:
 
 ```text
-One user-visible turn = one positive sample-to-sample token_delta interval.
+conversation turn = the interval that starts when the user sends one message
+and ends when the assistant finishes the final response for that message.
 ```
 
 Rules:
 
-- `turn_count` counts only intervals where `token_delta > 0`.
-- Baseline samples are not turns.
-- Zero-delta samples are not turns.
-- `sample_count` means number of samples or number of clean movement events; it
-  must not be displayed or used as turn count unless explicitly converted to
-  positive delta intervals.
+- Codex transcript `turn_id` is an internal id and is not a conversation turn.
+- A single conversation turn can contain multiple internal Codex steps,
+  token-count events, and sometimes multiple internal `turn_id` values.
+- Raw `samples` are token-count observations, not user-visible turns.
+- Persist completed conversation turns in a separate `conversation_turns`
+  aggregate table; normal UI and CLI statistics should read that table.
+- User-visible UI, CLI, stats, billing details, and estimates should use
+  completed conversation turns.
+- Baseline observations and intermediate in-progress token-count events are not
+  completed conversation turns.
+- Raw/internal exports may keep `turn_id`, but label it as internal Codex data.
 
 Estimator:
 
 ```text
-turns_per_weekly_percent =
-  sum(clean_event.turn_count) / sum(clean_event.percent_delta)
+conversation_turns_per_weekly_percent =
+  sum(clean_event.conversation_turn_count) / sum(clean_event.percent_delta)
 ```
 
-Each `clean_event.turn_count` is the number of positive `token_delta` intervals
-inside that clean movement event.
+Each clean event should count completed conversation turns inside that movement
+event, not positive raw sample intervals.
 
 Audit surfaces:
 
-- `usage_movement_events.turn_count`
-- `model_effort_fits.turns_per_weekly_percent`
-- `model_effort_global_fits.turns_per_weekly_percent`
-- billing period/day/week `turn_count`
-- widget `1% ~= X turns / Y tok`
+- `usage_movement_events.turn_count` or replacement conversation-turn count
+- `model_effort_fits.turns_per_weekly_percent` or renamed replacement
+- `model_effort_global_fits.turns_per_weekly_percent` or renamed replacement
+- billing period/day/week conversation-turn count
+- widget `1% ~= X conversations / Y tok`
 - stats panel `Clean 1%`
 - CLI `status` and `billing-stats`
 - README/user docs
+
+See `docs/conversation-turn-fix-plan.md` for the executor-facing fix plan.
 
 ## Movement Event Attribution
 

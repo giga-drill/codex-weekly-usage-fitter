@@ -12,7 +12,14 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .paths import db_path, ensure_usage_dirs
-from .transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit, parse_transcript
+from .transcript import (
+    TokenUsage,
+    TranscriptConversationTurn,
+    TranscriptSnapshot,
+    WeeklyLimit,
+    parse_conversation_turns,
+    parse_transcript,
+)
 
 
 EXTERNAL_TOKEN_THRESHOLD = 1000
@@ -141,12 +148,43 @@ class UsageStore:
                 external_usage_observed INTEGER NOT NULL DEFAULT 0,
                 buckets_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                conversation_turn_key TEXT NOT NULL UNIQUE,
+                user_message_timestamp TEXT NOT NULL,
+                user_message_index INTEGER NOT NULL,
+                start_observed_at TEXT NOT NULL,
+                end_observed_at TEXT NOT NULL,
+                transcript_path TEXT NOT NULL,
+                first_internal_turn_id TEXT,
+                last_internal_turn_id TEXT,
+                internal_turn_ids_json TEXT NOT NULL,
+                internal_token_deltas_json TEXT,
+                model TEXT,
+                reasoning_effort TEXT,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                token_delta INTEGER NOT NULL DEFAULT 0,
+                token_total_start INTEGER,
+                token_total_end INTEGER NOT NULL,
+                weekly_used_percent_start REAL,
+                weekly_used_percent_end REAL,
+                weekly_percent_delta REAL,
+                weekly_resets_at INTEGER,
+                weekly_window_minutes INTEGER,
+                completed INTEGER NOT NULL DEFAULT 1
+            );
             """
         )
         self._ensure_column("sessions", "reasoning_effort", "TEXT")
         self._ensure_column("samples", "reasoning_effort", "TEXT")
+        self._ensure_column(
+            "conversation_turns", "internal_token_deltas_json", "TEXT"
+        )
         self._backfill_model_effort()
         self._ensure_column("model_effort_fits", "turns_per_weekly_percent", "REAL")
+        self._ensure_conversation_turns()
         self._ensure_model_effort_fits()
         self.conn.commit()
 
@@ -188,10 +226,10 @@ class UsageStore:
             )
 
     def _ensure_model_effort_fits(self) -> None:
-        sample_count = self.conn.execute(
-            "SELECT COUNT(*) AS value FROM samples"
+        conversation_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
         ).fetchone()["value"]
-        if sample_count == 0:
+        if conversation_count == 0:
             return
         fit_count = self.conn.execute(
             "SELECT COUNT(*) AS value FROM model_effort_fits"
@@ -215,11 +253,12 @@ class UsageStore:
             SELECT COUNT(*) AS value
             FROM (
                 SELECT weekly_resets_at
-                FROM samples
+                FROM conversation_turns
                 WHERE weekly_resets_at IS NOT NULL
-                  AND weekly_used_percent IS NOT NULL
+                  AND weekly_used_percent_end IS NOT NULL
+                  AND completed = 1
                 GROUP BY weekly_resets_at
-                HAVING MAX(weekly_used_percent) > MIN(weekly_used_percent)
+                HAVING MAX(weekly_used_percent_end) > MIN(weekly_used_percent_end)
             )
             """
         ).fetchone()["value"]
@@ -231,6 +270,88 @@ class UsageStore:
             or needs_event_backfill
         ):
             self.rebuild_epochs_and_fits()
+
+    def _ensure_conversation_turns(self) -> None:
+        sample_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM samples"
+        ).fetchone()["value"]
+        if sample_count == 0:
+            return
+        if self._conversation_turns_need_rebuild():
+            self.rebuild_epochs_and_fits()
+
+    def _conversation_turns_need_rebuild(self) -> bool:
+        conversation_count = self.conn.execute(
+            "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+        ).fetchone()["value"]
+        if conversation_count == 0:
+            return True
+
+        missing_internal_delta_count = self.conn.execute(
+            """
+            SELECT COUNT(*) AS value
+            FROM conversation_turns
+            WHERE completed = 1
+              AND (
+                internal_token_deltas_json IS NULL
+                OR TRIM(internal_token_deltas_json) = ''
+                OR internal_token_deltas_json = 'null'
+              )
+            """
+        ).fetchone()["value"]
+        if missing_internal_delta_count > 0:
+            return True
+
+        token_delta_rows = self.conn.execute(
+            """
+            SELECT id, token_delta, internal_token_deltas_json
+            FROM conversation_turns
+            WHERE completed = 1
+            ORDER BY id
+            """
+        )
+        for row in token_delta_rows:
+            internal_deltas = _parse_internal_token_deltas(
+                row["internal_token_deltas_json"]
+            )
+            if internal_deltas is None:
+                return True
+            if internal_deltas and sum(internal_deltas.values()) != int(
+                row["token_delta"] or 0
+            ):
+                return True
+
+        weekly_rows = self.conn.execute(
+            """
+            SELECT
+                weekly_resets_at,
+                weekly_used_percent_end,
+                weekly_percent_delta
+            FROM conversation_turns
+            WHERE completed = 1
+              AND weekly_resets_at IS NOT NULL
+              AND weekly_used_percent_end IS NOT NULL
+            ORDER BY weekly_resets_at, end_observed_at, id
+            """
+        )
+        high_water_by_reset: dict[int, float] = {}
+        for row in weekly_rows:
+            reset_at = int(row["weekly_resets_at"])
+            current_percent = float(row["weekly_used_percent_end"])
+            prior_high = high_water_by_reset.get(reset_at)
+            expected_delta = _high_water_percent_delta(current_percent, prior_high)
+            stored_delta_raw = row["weekly_percent_delta"]
+            if stored_delta_raw is None:
+                return True
+            stored_delta = float(stored_delta_raw)
+            if not _close_float(stored_delta, expected_delta):
+                return True
+            high_water_by_reset[reset_at] = (
+                max(prior_high, current_percent)
+                if prior_high is not None
+                else current_percent
+            )
+        return False
 
     def record_sample(
         self,
@@ -428,6 +549,7 @@ class UsageStore:
 
     def rebuild_epochs_and_fits(self) -> None:
         with self.conn:
+            self._rebuild_conversation_turns()
             self.conn.execute("DELETE FROM epochs")
             self.conn.execute("DELETE FROM fits")
             self.conn.execute("DELETE FROM model_effort_fits")
@@ -439,7 +561,16 @@ class UsageStore:
                 for row in self.conn.execute(
                     """
                     SELECT DISTINCT weekly_resets_at
-                    FROM samples
+                    FROM (
+                        SELECT weekly_resets_at
+                        FROM conversation_turns
+                        WHERE completed = 1
+                          AND weekly_resets_at IS NOT NULL
+                        UNION
+                        SELECT weekly_resets_at
+                        FROM samples
+                        WHERE weekly_resets_at IS NOT NULL
+                    )
                     WHERE weekly_resets_at IS NOT NULL
                     ORDER BY weekly_resets_at
                     """
@@ -450,16 +581,33 @@ class UsageStore:
                     self.conn.execute(
                         """
                         SELECT
-                            id, observed_at, token_delta, weekly_used_percent,
+                            id, end_observed_at AS observed_at, token_delta,
+                            weekly_used_percent_end AS weekly_used_percent,
                             model, reasoning_effort
-                        FROM samples
+                        FROM conversation_turns
                         WHERE weekly_resets_at = ?
-                          AND weekly_used_percent IS NOT NULL
-                        ORDER BY observed_at, id
+                          AND weekly_used_percent_end IS NOT NULL
+                          AND completed = 1
+                        ORDER BY end_observed_at, id
                         """,
                         (reset_at,),
                     )
                 )
+                if not rows:
+                    rows = list(
+                        self.conn.execute(
+                            """
+                            SELECT
+                                id, observed_at, token_delta, weekly_used_percent,
+                                model, reasoning_effort
+                            FROM samples
+                            WHERE weekly_resets_at = ?
+                              AND weekly_used_percent IS NOT NULL
+                            ORDER BY observed_at, id
+                            """,
+                            (reset_at,),
+                        )
+                    )
                 if not rows:
                     continue
                 token_total = sum(int(row["token_delta"] or 0) for row in rows)
@@ -517,16 +665,26 @@ class UsageStore:
                         utc_now_iso(),
                     ),
                 )
-                self.conn.execute(
-                    """
-                    UPDATE samples
-                    SET external_usage_observed = ?
-                    WHERE weekly_resets_at = ?
-                    """,
-                    (int(external), reset_at),
-                )
 
-                movement_events = _usage_movement_events(rows, int(reset_at))
+                movement_rows = list(
+                    self.conn.execute(
+                        """
+                        SELECT
+                            id, end_observed_at AS observed_at, token_delta,
+                            weekly_used_percent_end AS weekly_used_percent,
+                            model, reasoning_effort
+                        FROM conversation_turns
+                        WHERE weekly_resets_at = ?
+                          AND weekly_used_percent_end IS NOT NULL
+                          AND completed = 1
+                        ORDER BY end_observed_at, id
+                        """,
+                        (reset_at,),
+                    )
+                )
+                if not movement_rows:
+                    movement_rows = rows
+                movement_events = _usage_movement_events(movement_rows, int(reset_at))
                 for event in movement_events:
                     self.conn.execute(
                         """
@@ -612,7 +770,146 @@ class UsageStore:
                     ),
                 )
 
+    def _rebuild_conversation_turns(self) -> None:
+        self.conn.execute("DELETE FROM conversation_turns")
+        transcript_paths = [
+            row["transcript_path"]
+            for row in self.conn.execute(
+                """
+                SELECT DISTINCT transcript_path
+                FROM samples
+                WHERE transcript_path IS NOT NULL
+                  AND transcript_path != ''
+                """
+            )
+        ]
+        parsed_turns: list[TranscriptConversationTurn] = []
+        for transcript_path in transcript_paths:
+            parsed_turns.extend(parse_conversation_turns(transcript_path))
+        if not parsed_turns:
+            return
+
+        parsed_turns.sort(
+            key=lambda item: (
+                _iso_to_utc_seconds(item.end_observed_at),
+                item.session_id or "",
+                item.user_message_index,
+                item.conversation_turn_key,
+            )
+        )
+
+        per_session_previous_total: dict[str, int] = {}
+        per_reset_high_water: dict[int, float] = {}
+
+        for turn in parsed_turns:
+            session_key = turn.session_id or "__unknown__"
+            previous_total = per_session_previous_total.get(session_key)
+            internal_token_delta_sum = sum(
+                max(0, int(value))
+                for value in turn.internal_token_deltas.values()
+            )
+            token_delta = internal_token_delta_sum
+            if token_delta == 0 and previous_total is not None:
+                token_delta = max(0, int(turn.token_total_end) - previous_total)
+            if previous_total is not None:
+                token_total_start = previous_total
+            elif token_delta > 0:
+                token_total_start = max(0, int(turn.token_total_end) - token_delta)
+            else:
+                token_total_start = None
+            per_session_previous_total[session_key] = int(turn.token_total_end)
+
+            weekly_used_percent_start: float | None = None
+            weekly_percent_delta = 0.0
+            if (
+                turn.weekly_resets_at_end is not None
+                and turn.weekly_used_percent_end is not None
+            ):
+                reset_at = int(turn.weekly_resets_at_end)
+                current_percent = float(turn.weekly_used_percent_end)
+                prior_high_water = per_reset_high_water.get(
+                    int(turn.weekly_resets_at_end)
+                )
+                if prior_high_water is not None:
+                    weekly_used_percent_start = prior_high_water
+                else:
+                    weekly_used_percent_start = current_percent
+                weekly_percent_delta = _high_water_percent_delta(
+                    current_percent, prior_high_water
+                )
+                per_reset_high_water[reset_at] = (
+                    max(prior_high_water, current_percent)
+                    if prior_high_water is not None
+                    else current_percent
+                )
+
+            self.conn.execute(
+                """
+                INSERT INTO conversation_turns (
+                    session_id,
+                    conversation_turn_key,
+                    user_message_timestamp,
+                    user_message_index,
+                    start_observed_at,
+                    end_observed_at,
+                    transcript_path,
+                    first_internal_turn_id,
+                    last_internal_turn_id,
+                    internal_turn_ids_json,
+                    internal_token_deltas_json,
+                    model,
+                    reasoning_effort,
+                    sample_count,
+                    token_delta,
+                    token_total_start,
+                    token_total_end,
+                    weekly_used_percent_start,
+                    weekly_used_percent_end,
+                    weekly_percent_delta,
+                    weekly_resets_at,
+                    weekly_window_minutes,
+                    completed
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    turn.session_id,
+                    turn.conversation_turn_key,
+                    turn.user_message_timestamp,
+                    turn.user_message_index,
+                    _iso_to_utc_seconds(turn.start_observed_at),
+                    _iso_to_utc_seconds(turn.end_observed_at),
+                    turn.transcript_path,
+                    turn.first_internal_turn_id,
+                    turn.last_internal_turn_id,
+                    json.dumps(list(turn.internal_turn_ids), separators=(",", ":")),
+                    json.dumps(
+                        turn.internal_token_deltas, separators=(",", ":"), sort_keys=True
+                    ),
+                    turn.model,
+                    _normalize_effort(turn.reasoning_effort),
+                    int(turn.sample_count),
+                    int(token_delta),
+                    token_total_start,
+                    int(turn.token_total_end),
+                    weekly_used_percent_start,
+                    turn.weekly_used_percent_end,
+                    weekly_percent_delta,
+                    turn.weekly_resets_at_end,
+                    turn.weekly_window_minutes_end,
+                ),
+            )
+
     def status(self) -> dict[str, Any]:
+        latest_conversation_turn = self.conn.execute(
+            """
+            SELECT *
+            FROM conversation_turns
+            WHERE completed = 1
+            ORDER BY end_observed_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
         latest = self.conn.execute(
             """
             SELECT *
@@ -627,6 +924,7 @@ class UsageStore:
             latest = self.conn.execute(
                 "SELECT * FROM samples ORDER BY observed_at DESC, id DESC LIMIT 1"
             ).fetchone()
+        latest_fit_row = latest_conversation_turn or latest
         latest_epoch = None
         latest_fit = None
         latest_model_effort_key = None
@@ -635,16 +933,16 @@ class UsageStore:
         model_effort_fits: list[sqlite3.Row] = []
         model_effort_global_fits: list[sqlite3.Row] = []
         mixed_movement_events: list[dict[str, Any]] = []
-        if latest is not None and latest["weekly_resets_at"] is not None:
+        if latest_fit_row is not None and latest_fit_row["weekly_resets_at"] is not None:
             latest_epoch = self.conn.execute(
                 "SELECT * FROM epochs WHERE weekly_resets_at = ?",
-                (latest["weekly_resets_at"],),
+                (latest_fit_row["weekly_resets_at"],),
             ).fetchone()
             latest_fit = self.conn.execute(
                 "SELECT * FROM fits WHERE weekly_resets_at = ?",
-                (latest["weekly_resets_at"],),
+                (latest_fit_row["weekly_resets_at"],),
             ).fetchone()
-            latest_key = _model_effort_key(latest)
+            latest_key = _model_effort_key(latest_fit_row)
             latest_model_effort_key = {
                 "model": latest_key[0],
                 "reasoning_effort": latest_key[1],
@@ -657,7 +955,7 @@ class UsageStore:
                   AND model = ?
                   AND reasoning_effort = ?
                 """,
-                (latest["weekly_resets_at"], latest_key[0], latest_key[1]),
+                (latest_fit_row["weekly_resets_at"], latest_key[0], latest_key[1]),
             ).fetchone()
             latest_model_effort_fit = self.conn.execute(
                 """
@@ -677,7 +975,7 @@ class UsageStore:
                     ORDER BY percent_delta DESC, token_delta_total DESC
                     LIMIT 5
                     """,
-                    (latest["weekly_resets_at"],),
+                    (latest_fit_row["weekly_resets_at"],),
                 )
             )
             model_effort_global_fits = list(
@@ -701,7 +999,7 @@ class UsageStore:
                     ORDER BY observed_at DESC, id DESC
                     LIMIT 5
                     """,
-                    (latest["weekly_resets_at"],),
+                    (latest_fit_row["weekly_resets_at"],),
                 )
             ]
 
@@ -710,14 +1008,14 @@ class UsageStore:
         ).fetchone()["value"]
 
         epoch_observed = None
-        if latest is not None and latest["weekly_resets_at"] is not None:
+        if latest_fit_row is not None and latest_fit_row["weekly_resets_at"] is not None:
             epoch_observed = self.conn.execute(
                 """
                 SELECT COALESCE(SUM(token_delta), 0) AS value
                 FROM samples
                 WHERE weekly_resets_at = ?
                 """,
-                (latest["weekly_resets_at"],),
+                (latest_fit_row["weekly_resets_at"],),
             ).fetchone()["value"]
 
         return {
@@ -725,12 +1023,18 @@ class UsageStore:
             "sample_count": self.conn.execute(
                 "SELECT COUNT(*) AS value FROM samples"
             ).fetchone()["value"],
+            "conversation_turn_count": self.conn.execute(
+                "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+            ).fetchone()["value"],
             "session_count": self.conn.execute(
                 "SELECT COUNT(*) AS value FROM sessions"
             ).fetchone()["value"],
             "total_observed_tokens": total_observed,
             "epoch_observed_tokens": epoch_observed,
             "latest_sample": _public_sample_row(latest),
+            "latest_conversation_turn": _public_conversation_turn_row(
+                latest_conversation_turn
+            ),
             "latest_epoch": _row_to_dict(latest_epoch),
             "latest_fit": _row_to_dict(latest_fit),
             "latest_model_effort_key": latest_model_effort_key,
@@ -757,24 +1061,62 @@ class UsageStore:
         rows = list(
             self.conn.execute(
                 """
-                SELECT observed_at, weekly_used_percent, token_delta
+                SELECT
+                    end_observed_at,
+                    weekly_used_percent_start,
+                    weekly_used_percent_end,
+                    weekly_percent_delta,
+                    token_delta
+                FROM conversation_turns
+                WHERE completed = 1
+                  AND end_observed_at >= ?
+                  AND end_observed_at < ?
+                ORDER BY end_observed_at, id
+                """,
+                (start_utc, end_utc),
+            )
+        )
+        if not rows:
+            raw_sample_count = self.conn.execute(
+                """
+                SELECT COUNT(*) AS value
                 FROM samples
                 WHERE observed_at >= ?
                   AND observed_at < ?
                   AND weekly_used_percent IS NOT NULL
                   AND parse_error IS NULL
-                ORDER BY observed_at, id
                 """,
                 (start_utc, end_utc),
-            )
+            ).fetchone()["value"]
+            return {
+                "date": local_start.date().isoformat(),
+                "first_used_percent": None,
+                "last_used_percent": None,
+                "used_percent_delta": 0.0,
+                "level": "low",
+                "token_delta_total": 0,
+                "latest_conversation_turn_token_delta": None,
+                "latest_turn_token_delta": None,
+                "sample_count": 0,
+                "conversation_turn_count": 0,
+                "error": (
+                    "conversation_turns_unavailable_for_today"
+                    if raw_sample_count > 0
+                    else None
+                ),
+                "raw_sample_count": int(raw_sample_count),
+            }
+        first_percent = (
+            float(rows[0]["weekly_used_percent_start"])
+            if rows and rows[0]["weekly_used_percent_start"] is not None
+            else None
         )
-        first_percent = float(rows[0]["weekly_used_percent"]) if rows else None
-        last_percent = float(rows[-1]["weekly_used_percent"]) if rows else None
-        used_delta = (
-            max(0.0, last_percent - first_percent)
-            if first_percent is not None and last_percent is not None
-            else 0.0
+        last_percent = (
+            float(rows[-1]["weekly_used_percent_end"])
+            if rows and rows[-1]["weekly_used_percent_end"] is not None
+            else None
         )
+        used_delta = sum(float(row["weekly_percent_delta"] or 0.0) for row in rows)
         return {
             "date": local_start.date().isoformat(),
             "first_used_percent": first_percent,
@@ -782,8 +1124,12 @@ class UsageStore:
             "used_percent_delta": used_delta,
             "level": _today_usage_level(used_delta),
             "token_delta_total": sum(int(row["token_delta"] or 0) for row in rows),
+            "latest_conversation_turn_token_delta": (
+                int(rows[-1]["token_delta"] or 0) if rows else None
+            ),
             "latest_turn_token_delta": int(rows[-1]["token_delta"] or 0) if rows else None,
             "sample_count": len(rows),
+            "conversation_turn_count": len(rows),
         }
 
     def billing_stats(
@@ -814,7 +1160,7 @@ class UsageStore:
             period_end = current_end
             label = "This billing period"
 
-        rows = self._billing_sample_rows(period_end)
+        rows = self._billing_conversation_turn_rows(period_end)
         weekly_windows = _billing_weekly_windows(period_start, period_end)
         week_metrics = [_empty_metric(window[0], window[1]) for window in weekly_windows]
         daily_metrics = [
@@ -824,32 +1170,47 @@ class UsageStore:
         ]
         period_metric = _empty_metric(period_start, period_end)
         debug_samples = []
-        previous_percent: float | None = None
+        raw_row_count = self.conn.execute(
+            """
+            SELECT COUNT(*) AS value
+            FROM samples
+            WHERE observed_at >= ?
+              AND observed_at < ?
+              AND parse_error IS NULL
+            """,
+            (
+                period_start.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                period_end.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        ).fetchone()["value"]
+        if not rows and raw_row_count > 0:
+            raise RuntimeError(
+                "conversation_turns unavailable for billing period while raw samples exist"
+            )
 
         for row in rows:
-            observed_utc = _parse_iso_datetime(row["observed_at"])
+            observed_utc = _parse_iso_datetime(row["end_observed_at"])
             if observed_utc is None:
                 continue
             observed_local = observed_utc.astimezone(local_tz)
-            current_percent = (
-                float(row["weekly_used_percent"])
-                if row["weekly_used_percent"] is not None
-                else None
-            )
-            movement = 0.0
-            if current_percent is not None and previous_percent is not None:
-                movement = max(0.0, current_percent - previous_percent)
+            movement = float(row["weekly_percent_delta"] or 0.0)
+            usage_start = row["weekly_used_percent_start"]
+            usage_end = row["weekly_used_percent_end"]
+            internal_turn_id = row["last_internal_turn_id"]
+            conversation_turn_key = row["conversation_turn_key"]
 
             in_period = period_start <= observed_local < period_end
             if in_period:
                 token_delta = int(row["token_delta"] or 0)
                 sample = {
                     "observed_at": observed_local.isoformat(timespec="seconds"),
-                    "usage_percent": current_percent,
+                    "usage_percent_start": usage_start,
+                    "usage_percent_end": usage_end,
                     "usage_percent_delta": movement,
                     "token_delta": token_delta,
                     "session_id": row["session_id"],
-                    "turn_id": row["turn_id"],
+                    "turn_id": internal_turn_id,
+                    "conversation_turn_key": conversation_turn_key,
                     "model": row["model"],
                     "reasoning_effort": row["reasoning_effort"],
                 }
@@ -864,9 +1225,6 @@ class UsageStore:
                         break
                 if debug:
                     debug_samples.append(sample)
-
-            if current_percent is not None:
-                previous_percent = current_percent
 
         formatted_weeks = []
         for metric, days in zip(week_metrics, daily_metrics):
@@ -893,18 +1251,20 @@ class UsageStore:
             output["debug_samples"] = debug_samples
         return output
 
-    def _billing_sample_rows(self, period_end: datetime) -> list[sqlite3.Row]:
+    def _billing_conversation_turn_rows(self, period_end: datetime) -> list[sqlite3.Row]:
         end_utc = period_end.astimezone(timezone.utc).isoformat(timespec="seconds")
         return list(
             self.conn.execute(
                 """
                 SELECT
-                    observed_at, weekly_used_percent, token_delta, session_id,
-                    turn_id, model, reasoning_effort
-                FROM samples
-                WHERE observed_at < ?
-                  AND parse_error IS NULL
-                ORDER BY observed_at, id
+                    end_observed_at, weekly_used_percent_start, weekly_used_percent_end,
+                    weekly_percent_delta, token_delta, session_id,
+                    first_internal_turn_id, last_internal_turn_id,
+                    conversation_turn_key, model, reasoning_effort
+                FROM conversation_turns
+                WHERE completed = 1
+                  AND end_observed_at < ?
+                ORDER BY end_observed_at, id
                 """,
                 (end_utc,),
             )
@@ -1156,12 +1516,12 @@ def _usage_movement_events(
 
     output: list[dict[str, Any]] = []
     pending_rows: list[sqlite3.Row] = []
-    previous_percent = float(rows[0]["weekly_used_percent"])
+    high_water_percent = float(rows[0]["weekly_used_percent"])
 
     for row in rows[1:]:
         pending_rows.append(row)
         current_percent = float(row["weekly_used_percent"])
-        movement = current_percent - previous_percent
+        movement = _high_water_percent_delta(current_percent, high_water_percent)
         if movement > 0:
             buckets: dict[tuple[str, str], dict[str, Any]] = {}
             token_delta_total = 0
@@ -1209,11 +1569,7 @@ def _usage_movement_events(
                 }
             )
             pending_rows.clear()
-        elif movement < 0:
-            # Percent dropped within the same reset window. Treat this as a boundary
-            # and avoid attributing earlier pending turns across the drop.
-            pending_rows.clear()
-        previous_percent = current_percent
+        high_water_percent = max(high_water_percent, current_percent)
     return output
 
 
@@ -1419,21 +1775,58 @@ def _model_effort_key(row: sqlite3.Row) -> tuple[str, str]:
 
 
 def _external_usage_observed(rows: Iterable[sqlite3.Row]) -> bool:
-    previous_percent: float | None = None
+    row_list = list(rows)
+    if len(row_list) < 2:
+        return False
+    high_water_percent = float(row_list[0]["weekly_used_percent"])
     pending_tokens = 0
-    for row in rows:
+    for row in row_list[1:]:
         percent = float(row["weekly_used_percent"])
         pending_tokens += int(row["token_delta"] or 0)
-        if previous_percent is None:
-            previous_percent = percent
-            pending_tokens = 0
-            continue
-        if percent > previous_percent:
+        movement = _high_water_percent_delta(percent, high_water_percent)
+        if movement > 0:
             if pending_tokens <= EXTERNAL_TOKEN_THRESHOLD:
                 return True
             pending_tokens = 0
-        previous_percent = percent
+        high_water_percent = max(high_water_percent, percent)
     return False
+
+
+def _parse_internal_token_deltas(value: Any) -> dict[str, int] | None:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    output: dict[str, int] = {}
+    for key, raw in parsed.items():
+        turn_id = _string_or_none(key)
+        if turn_id is None:
+            return None
+        try:
+            delta = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if delta < 0:
+            return None
+        output[turn_id] = delta
+    return output
+
+
+def _high_water_percent_delta(
+    current_percent: float, prior_high_water: float | None
+) -> float:
+    if prior_high_water is None:
+        return 0.0
+    return max(0.0, current_percent - prior_high_water)
+
+
+def _close_float(left: float, right: float, epsilon: float = 1e-9) -> bool:
+    return abs(left - right) <= epsilon
 
 
 def _confidence(sample_count: int, percent_delta: float, external: bool) -> str:
@@ -1469,3 +1862,10 @@ def _public_sample_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         for key, value in data.items()
         if not key.startswith("last_")
     }
+
+
+def _public_conversation_turn_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    data = _row_to_dict(row)
+    if data is None:
+        return None
+    return data

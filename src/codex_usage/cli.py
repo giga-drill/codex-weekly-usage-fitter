@@ -177,12 +177,16 @@ def _cmd_status(home: Path, args: argparse.Namespace) -> int:
 def _cmd_billing_stats(home: Path, args: argparse.Namespace) -> int:
     store = UsageStore(home)
     try:
-        stats = store.billing_stats(
-            billing_day=args.billing_day,
-            period=args.period,
-            timezone_name=args.timezone,
-            debug=args.debug,
-        )
+        try:
+            stats = store.billing_stats(
+                billing_day=args.billing_day,
+                period=args.period,
+                timezone_name=args.timezone,
+                debug=args.debug,
+            )
+        except RuntimeError as exc:
+            print(f"Error: {exc}")
+            return 1
     finally:
         store.close()
 
@@ -241,6 +245,7 @@ def _toml_string(value: str) -> str:
 
 def _format_status(status: dict[str, Any]) -> str:
     latest = status.get("latest_sample")
+    latest_conversation = status.get("latest_conversation_turn")
     fit = status.get("latest_fit")
     epoch = status.get("latest_epoch")
     model_effort_key = status.get("latest_model_effort_key") or {}
@@ -253,6 +258,9 @@ def _format_status(status: dict[str, Any]) -> str:
     lines.append(f"Home: {status['home']}")
     lines.append(
         f"Samples: {status['sample_count']} across {status['session_count']} sessions"
+    )
+    lines.append(
+        f"Completed conversation turns: {status.get('conversation_turn_count', 0)}"
     )
 
     if not latest:
@@ -275,10 +283,25 @@ def _format_status(status: dict[str, Any]) -> str:
         lines.append(
             "Today usage: "
             f"{today['used_percent_delta']:.3g}% "
-            f"({today['level']}, samples {today['sample_count']})"
+            f"({today['level']}, conversations {today.get('conversation_turn_count', today['sample_count'])})"
+        )
+        if today.get("error"):
+            lines.append(
+                f"Today usage warning: {today['error']} "
+                f"(raw samples {today.get('raw_sample_count', 0)})"
+            )
+    if latest_conversation:
+        lines.append(
+            "Latest conversation turn: "
+            f"session={latest_conversation.get('session_id') or '-'} "
+            f"internal={latest_conversation.get('last_internal_turn_id') or '-'} "
+            f"model={latest_conversation.get('model') or '-'} "
+            f"effort={latest_conversation.get('reasoning_effort') or '-'} "
+            f"delta={latest_conversation.get('token_delta')} "
+            f"total={latest_conversation.get('token_total_end')}"
         )
     lines.append(
-        "Latest sample: "
+        "Latest raw sample (internal): "
         f"session={latest.get('session_id') or '-'} "
         f"turn={latest.get('turn_id') or '-'} "
         f"model={latest.get('model') or '-'} "
@@ -305,7 +328,7 @@ def _format_status(status: dict[str, Any]) -> str:
                 "Fit: "
                 f"{tpp:.0f} tokens per 1% weekly "
                 f"(confidence {fit['confidence']}, "
-                f"samples {fit['sample_count']})"
+                f"observations {fit['sample_count']})"
             )
         external = "yes" if fit.get("external_usage_observed") else "no"
         lines.append(f"External usage observed: {external}")
@@ -327,12 +350,15 @@ def _format_status(status: dict[str, Any]) -> str:
     if mixed_events:
         lines.append("Recent mixed movement observations:")
         for event in mixed_events[:3]:
+            external_hint = (
+                " [external-like]" if event.get("external_usage_observed") else ""
+            )
             lines.append(
                 "  - "
                 f"{event.get('combination') or 'unknown'}: "
                 f"+{event.get('percent_delta', 0):.3g}% "
                 f"{_format_token_count(event.get('token_delta_total'))}, "
-                f"{event.get('turn_count', 0)} turns"
+                f"{event.get('turn_count', 0)} conversation turns{external_hint}"
             )
 
     return "\n".join(lines)
@@ -349,9 +375,9 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
     lines.append("Summary")
     lines.append(f"Usage: +{period['usage_percent_delta']:.3g}%")
     lines.append(f"Tokens: {_format_token_count(period['token_delta_total'])}")
-    lines.append(f"Turns: {period['turn_count']}")
+    lines.append(f"Conversation turns: {period['turn_count']}")
     lines.append(
-        "Avg / turn: "
+        "Avg / conversation: "
         + (
             _format_token_count(period["avg_tokens_per_turn"])
             if period["avg_tokens_per_turn"] is not None
@@ -366,14 +392,14 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
             f"{_format_period_date(window['end'])}   "
             f"+{window['usage_percent_delta']:.3g}%   "
             f"{_format_token_count(window['token_delta_total'])}   "
-            f"{window['turn_count']} turns"
+            f"{window['turn_count']} conv"
         )
         for day in window["days"]:
             lines.append(
                 f"  {_format_period_date(day['start']):<6}   "
                 f"+{day['usage_percent_delta']:.3g}%   "
                 f"{_format_token_count(day['token_delta_total']):>9}   "
-                f"{day['turn_count']} turns"
+                f"{day['turn_count']} conv"
             )
     mixed_combinations = stats.get("mixed_movement_combinations") or []
     if mixed_combinations:
@@ -383,32 +409,37 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
             lines.append(
                 f"{item['combination']}: +{item['percent_delta']:.3g}%   "
                 f"{_format_token_count(item['token_delta_total'])}   "
-                f"{item['turn_count']} turns   {item['event_count']} events"
+                f"{item['turn_count']} conversation turns   {item['event_count']} events"
             )
     if debug:
         lines.append("")
-        lines.append("Samples used")
+        lines.append("Conversation turns used")
         for sample in stats.get("debug_samples", []):
-            usage = sample["usage_percent"]
-            usage_text = f"{usage:.3g}%" if usage is not None else "--"
+            usage_start = sample.get("usage_percent_start")
+            usage_end = sample.get("usage_percent_end")
+            usage_start_text = f"{usage_start:.3g}%" if usage_start is not None else "--"
+            usage_end_text = f"{usage_end:.3g}%" if usage_end is not None else "--"
             model = sample.get("model") or "-"
             effort = sample.get("reasoning_effort") or "-"
             lines.append(
-                f"{sample['observed_at']}  weekly={usage_text:<6} "
+                f"{sample['observed_at']}  weekly={usage_start_text}->{usage_end_text} "
                 f"move=+{sample['usage_percent_delta']:.3g}% "
                 f"delta={_format_token_count(sample['token_delta']):>9} "
-                f"model={model}/{effort} turn={sample.get('turn_id') or '-'}"
+                f"model={model}/{effort} turn={sample.get('conversation_turn_key') or sample.get('turn_id') or '-'}"
             )
         mixed_events = stats.get("mixed_movement_events") or []
         if mixed_events:
             lines.append("")
             lines.append("Mixed movement events")
             for event in mixed_events:
+                external_hint = (
+                    " external-like" if event.get("external_usage_observed") else ""
+                )
                 lines.append(
                     f"{event.get('observed_at_local') or event.get('observed_at')}  "
                     f"{event['combination']}  +{event['percent_delta']:.3g}%  "
                     f"delta={_format_token_count(event['token_delta_total'])}  "
-                    f"turns={event['turn_count']}"
+                    f"conversation_turns={event['turn_count']}{external_hint}"
                 )
     return "\n".join(lines)
 
@@ -419,13 +450,13 @@ def _format_model_effort_fit(fit: dict[str, Any]) -> str:
     if tpp is None:
         return (
             f"{label}: waiting for weekly percent movement "
-            f"(confidence {fit['confidence']}, samples {fit['sample_count']})"
+            f"(confidence {fit['confidence']}, observations {fit['sample_count']})"
         )
     turns = fit.get("turns_per_weekly_percent")
-    turn_text = f", turns/1% {turns:.2g}" if turns is not None else ""
+    turn_text = f", conversations/1% {turns:.2g}" if turns is not None else ""
     return (
         f"{label}: {tpp:.0f} tokens per 1% weekly "
-        f"(confidence {fit['confidence']}, samples {fit['sample_count']}{turn_text}, "
+        f"(confidence {fit['confidence']}, observations {fit['sample_count']}{turn_text}, "
         f"percent {fit['percent_delta']:.3g})"
     )
 

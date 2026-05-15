@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_usage.transcript import parse_transcript
+from codex_usage.transcript import parse_conversation_turns, parse_transcript
 
 
 class TranscriptParserTests(unittest.TestCase):
@@ -206,6 +206,148 @@ class TranscriptParserTests(unittest.TestCase):
     def test_missing_transcript_reports_error(self) -> None:
         snapshot = parse_transcript("/tmp/does-not-exist-codex-usage.jsonl")
         self.assertEqual(snapshot.error, "missing transcript")
+
+    def test_parse_conversation_turns_aggregates_multiple_token_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-05-09T02:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "s1"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"turn_id": "t1", "model": "gpt-a", "effort": "high"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hi"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 100}},
+                        "rate_limits": {"secondary": {"used_percent": 10}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 130}},
+                        "rate_limits": {"secondary": {"used_percent": 10.5}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:05Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": "t1"},
+                },
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            turns = parse_conversation_turns(path)
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].session_id, "s1")
+            self.assertEqual(turns[0].token_total_end, 130)
+            self.assertEqual(turns[0].sample_count, 2)
+            self.assertEqual(turns[0].first_internal_turn_id, "t1")
+            self.assertEqual(turns[0].last_internal_turn_id, "t1")
+
+    def test_parse_conversation_turns_exposes_internal_delta_breakdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-05-09T02:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "s1"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"turn_id": "t1", "model": "gpt-a", "effort": "high"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hi"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 120}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:04Z",
+                    "type": "turn_context",
+                    "payload": {"turn_id": "t2", "model": "gpt-a", "effort": "high"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:05Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 200}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:06Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": "t2"},
+                },
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            turns = parse_conversation_turns(path)
+
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].internal_turn_ids, ("t1", "t2"))
+            self.assertEqual(
+                getattr(turns[0], "internal_token_deltas", None),
+                {"t1": 120, "t2": 80},
+            )
+            self.assertEqual(sum(turns[0].internal_token_deltas.values()), 200)
+
+    def test_parse_conversation_turns_does_not_emit_active_eof_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-05-09T02:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "s1"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"turn_id": "t1", "model": "gpt-a", "effort": "high"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hi"},
+                },
+                {
+                    "timestamp": "2026-05-09T02:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 100}},
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            turns = parse_conversation_turns(path)
+            self.assertEqual(turns, [])
 
 
 if __name__ == "__main__":

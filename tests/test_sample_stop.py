@@ -147,9 +147,9 @@ class SampleStopTests(unittest.TestCase):
             finally:
                 collector.close()
 
-            self.assertEqual(inserted, 2)
+            self.assertEqual(inserted, 1)
             self.assertEqual(inserted_again, 0)
-            self.assertEqual(len(samples), 2)
+            self.assertEqual(len(samples), 1)
             self.assertEqual(
                 samples[0]["session_id"],
                 "019e1000-0000-7000-8000-000000000000",
@@ -159,12 +159,6 @@ class SampleStopTests(unittest.TestCase):
                 "019e1000-0001-7000-8000-000000000000",
             )
             self.assertEqual(samples[0]["token_delta"], 0)
-            self.assertEqual(
-                samples[1]["turn_id"],
-                "019e1001-0000-7000-8000-000000000000",
-            )
-            self.assertEqual(samples[1]["token_total"], 175)
-            self.assertEqual(samples[1]["token_delta"], 75)
 
 
 if __name__ == "__main__":
