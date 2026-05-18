@@ -160,6 +160,117 @@ class SampleStopTests(unittest.TestCase):
             )
             self.assertEqual(samples[0]["token_delta"], 0)
 
+    def test_scan_recent_transcripts_keeps_numeric_internal_turn_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "usage"
+            codex_home = root / "codex"
+            session_dir = codex_home / "sessions" / "2026" / "05" / "18"
+            session_dir.mkdir(parents=True)
+            transcript = session_dir / "rollout-2026-05-18T01-00-00-session.jsonl"
+            rows = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "019f0000-0000-7000-8000-000000000000",
+                        "cwd": "/tmp/project",
+                    },
+                },
+                {
+                    "timestamp": "2026-05-18T01:00:01Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "4",
+                        "model": "gpt-test",
+                        "effort": "high",
+                    },
+                },
+                {
+                    "timestamp": "2026-05-18T01:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hello"},
+                },
+                {
+                    "timestamp": "2026-05-18T01:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 40}},
+                        "rate_limits": {"secondary": {"used_percent": 12}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-18T01:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 130}},
+                        "rate_limits": {"secondary": {"used_percent": 13}},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-18T01:00:05Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": "4"},
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            collector = UsageCollector(
+                home,
+                codex_home=codex_home,
+                delay_seconds=0,
+                use_app_server=False,
+            )
+            try:
+                inserted = collector.scan_recent_transcripts(since_seconds=3600)
+                inserted_again = collector.scan_recent_transcripts(since_seconds=3600)
+                samples = list(
+                    collector.store.conn.execute(
+                        """
+                        SELECT turn_id, token_delta
+                        FROM samples
+                        ORDER BY id
+                        """
+                    )
+                )
+                conversation_turns = list(
+                    collector.store.conn.execute(
+                        """
+                        SELECT
+                            last_internal_turn_id AS turn_id,
+                            token_delta,
+                            internal_turn_ids_json,
+                            internal_token_deltas_json
+                        FROM conversation_turns
+                        WHERE completed = 1
+                        ORDER BY id
+                        """
+                    )
+                )
+            finally:
+                collector.close()
+
+            self.assertEqual(inserted, 1)
+            self.assertEqual(inserted_again, 0)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0]["turn_id"], "4")
+            self.assertEqual(samples[0]["token_delta"], 0)
+            self.assertEqual(len(conversation_turns), 1)
+            self.assertEqual(conversation_turns[0]["turn_id"], "4")
+            self.assertEqual(conversation_turns[0]["token_delta"], 130)
+            self.assertEqual(
+                json.loads(conversation_turns[0]["internal_turn_ids_json"]),
+                ["4"],
+            )
+            self.assertEqual(
+                json.loads(conversation_turns[0]["internal_token_deltas_json"]),
+                {"4": 130},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

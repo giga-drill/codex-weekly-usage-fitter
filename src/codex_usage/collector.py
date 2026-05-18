@@ -291,6 +291,22 @@ def _safe_mtime(path: Path) -> float:
         return 0
 
 
+def _is_comparable_uuid_like(value: str | None) -> bool:
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+    segments = value.split("-")
+    if [len(segment) for segment in segments] != [8, 4, 4, 4, 12]:
+        return False
+    allowed = set("0123456789abcdefABCDEF")
+    return all(char in allowed for segment in segments for char in segment)
+
+
+def _should_skip_pre_session_turn(session_id: str | None, turn_id: str | None) -> bool:
+    if not _is_comparable_uuid_like(session_id) or not _is_comparable_uuid_like(turn_id):
+        return False
+    return str(turn_id) < str(session_id)
+
+
 def _transcript_turns(path: Path) -> list[TranscriptTurn]:
     session_id: str | None = None
     cwd: str | None = None
@@ -311,7 +327,7 @@ def _transcript_turns(path: Path) -> list[TranscriptTurn]:
             active_has_task_complete = False
             return
         turn_id = _string_or_none(active_turn.get("turn_id"))
-        if session_id is not None and turn_id is not None and turn_id < session_id:
+        if _should_skip_pre_session_turn(session_id, turn_id):
             active_turn = None
             active_has_token_count = False
             active_has_task_complete = False

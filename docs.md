@@ -73,7 +73,22 @@ Latest validation state:
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Current result: 46 passing tests (revalidated on 2026-05-18).
+Current result: 50 passing tests (revalidated on 2026-05-18).
+
+Latest fix notes (2026-05-18):
+
+- transcript scan pre-session filtering now only compares ordered UUID-like
+  ids when both `session_id` and `turn_id` are comparable; numeric internal
+  turn ids like `"4"` are preserved.
+- stale detection now rebuilds when parsed completed conversation-turn keys
+  from transcript-backed raw samples are missing from `conversation_turns`,
+  and then refreshes dependent movement/fits tables.
+- conversation-turn stale detection now caches per-transcript parse state
+  (sample fingerprint + transcript mtime + parsed turn count) so stable
+  `UsageStore` reopen no longer reparses unchanged transcript history.
+- missing/unreadable transcripts now keep existing aggregates conservatively:
+  reopen no longer reparses or downgrades parse-state to zero in ways that can
+  trigger destructive stale rebuilds on otherwise stable databases.
 
 ## Active Notes
 

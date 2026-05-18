@@ -5,10 +5,16 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from codex_usage.store import UsageStore
-from codex_usage.transcript import TokenUsage, TranscriptSnapshot, WeeklyLimit
+from codex_usage.transcript import (
+    TokenUsage,
+    TranscriptSnapshot,
+    WeeklyLimit,
+    parse_conversation_turns as parse_conversation_turns_fn,
+)
 
 
 class StoreTests(unittest.TestCase):
@@ -648,6 +654,289 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(conversation_percent_delta, 1.0)
             self.assertGreaterEqual(movement_token_min, 0)
             self.assertGreaterEqual(fit_token_min, 0)
+
+    def test_existing_db_missing_conversation_turn_key_triggers_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript_path = home / "session.jsonl"
+            self.write_transcript(
+                transcript_path,
+                "s1",
+                [
+                    {
+                        "token_events": [
+                            {"turn_id": "t1", "total": 100, "percent": 10.0},
+                        ]
+                    },
+                    {
+                        "token_events": [
+                            {"turn_id": "t2", "total": 220, "percent": 11.0},
+                        ]
+                    },
+                    {
+                        "token_events": [
+                            {"turn_id": "t3", "total": 360, "percent": 12.0},
+                        ]
+                    },
+                ],
+            )
+
+            store = UsageStore(home)
+            try:
+                for index, percent in enumerate([10.0, 11.0, 12.0], start=1):
+                    self.insert_raw_sample_row(
+                        store,
+                        event_id=f"raw-{index}",
+                        observed_at=f"2026-05-12T00:0{index}:00+00:00",
+                        transcript_path=transcript_path,
+                        session_id="s1",
+                        token_delta=100,
+                        weekly_used_percent=percent,
+                    )
+                store.rebuild_epochs_and_fits()
+                expected_count = store.conn.execute(
+                    "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                ).fetchone()["value"]
+                self.assertGreaterEqual(expected_count, 2)
+                with store.conn:
+                    store.conn.execute(
+                        """
+                        DELETE FROM conversation_turns
+                        WHERE id = (
+                            SELECT id
+                            FROM conversation_turns
+                            WHERE completed = 1
+                            ORDER BY id DESC
+                            LIMIT 1
+                        )
+                        """
+                    )
+                    store.conn.execute(
+                        "UPDATE usage_movement_events SET token_delta_total = -123"
+                    )
+                    store.conn.execute("UPDATE fits SET token_delta_total = -123")
+            finally:
+                store.close()
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_on_reopen:
+                reopened = UsageStore(home)
+                try:
+                    rebuilt_count = reopened.conn.execute(
+                        "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                    ).fetchone()["value"]
+                    movement_token_min = reopened.conn.execute(
+                        "SELECT MIN(token_delta_total) AS value FROM usage_movement_events"
+                    ).fetchone()["value"]
+                    fit_token_min = reopened.conn.execute(
+                        "SELECT MIN(token_delta_total) AS value FROM fits"
+                    ).fetchone()["value"]
+                    reopened.rebuild_epochs_and_fits()
+                    rebuilt_count_again = reopened.conn.execute(
+                        "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                    ).fetchone()["value"]
+                finally:
+                    reopened.close()
+
+            self.assertEqual(rebuilt_count, expected_count)
+            self.assertEqual(rebuilt_count_again, expected_count)
+            self.assertGreaterEqual(movement_token_min, 0)
+            self.assertGreaterEqual(fit_token_min, 0)
+            self.assertGreaterEqual(parse_on_reopen.call_count, 0)
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_on_stable_reopen:
+                reopened_again = UsageStore(home)
+                try:
+                    stable_count = reopened_again.conn.execute(
+                        "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                    ).fetchone()["value"]
+                finally:
+                    reopened_again.close()
+
+            self.assertEqual(stable_count, expected_count)
+            self.assertEqual(parse_on_stable_reopen.call_count, 0)
+
+    def test_stable_reopen_does_not_reparse_unchanged_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript_path = home / "session.jsonl"
+            self.write_transcript(
+                transcript_path,
+                "s1",
+                [
+                    {"token_events": [{"turn_id": "t1", "total": 100, "percent": 10.0}]},
+                    {"token_events": [{"turn_id": "t2", "total": 220, "percent": 11.0}]},
+                ],
+            )
+
+            store = UsageStore(home)
+            try:
+                self.insert_raw_sample_row(
+                    store,
+                    event_id="raw-1",
+                    observed_at="2026-05-12T00:01:00+00:00",
+                    transcript_path=transcript_path,
+                    session_id="s1",
+                    token_delta=0,
+                    weekly_used_percent=10.0,
+                )
+                self.insert_raw_sample_row(
+                    store,
+                    event_id="raw-2",
+                    observed_at="2026-05-12T00:02:00+00:00",
+                    transcript_path=transcript_path,
+                    session_id="s1",
+                    token_delta=120,
+                    weekly_used_percent=11.0,
+                )
+                store.rebuild_epochs_and_fits()
+            finally:
+                store.close()
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_first_reopen:
+                first_reopen = UsageStore(home)
+                first_reopen.close()
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_second_reopen:
+                second_reopen = UsageStore(home)
+                second_reopen.close()
+
+            self.assertEqual(parse_first_reopen.call_count, 0)
+            self.assertEqual(parse_second_reopen.call_count, 0)
+
+    def test_missing_transcript_keeps_existing_aggregates_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript_path = home / "session.jsonl"
+            self.write_transcript(
+                transcript_path,
+                "s1",
+                [
+                    {"token_events": [{"turn_id": "t1", "total": 100, "percent": 10.0}]},
+                    {"token_events": [{"turn_id": "t2", "total": 250, "percent": 11.0}]},
+                ],
+            )
+
+            store = UsageStore(home)
+            try:
+                self.insert_raw_sample_row(
+                    store,
+                    event_id="raw-1",
+                    observed_at="2026-05-12T00:01:00+00:00",
+                    transcript_path=transcript_path,
+                    session_id="s1",
+                    token_delta=0,
+                    weekly_used_percent=10.0,
+                )
+                self.insert_raw_sample_row(
+                    store,
+                    event_id="raw-2",
+                    observed_at="2026-05-12T00:02:00+00:00",
+                    transcript_path=transcript_path,
+                    session_id="s1",
+                    token_delta=150,
+                    weekly_used_percent=11.0,
+                )
+                store.rebuild_epochs_and_fits()
+                before_counts = {
+                    "conversation_turns": store.conn.execute(
+                        "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                    ).fetchone()["value"],
+                    "fits": store.conn.execute(
+                        "SELECT COUNT(*) AS value FROM fits"
+                    ).fetchone()["value"],
+                    "model_effort_fits": store.conn.execute(
+                        "SELECT COUNT(*) AS value FROM model_effort_fits"
+                    ).fetchone()["value"],
+                    "model_effort_global_fits": store.conn.execute(
+                        "SELECT COUNT(*) AS value FROM model_effort_global_fits"
+                    ).fetchone()["value"],
+                    "movement_events": store.conn.execute(
+                        "SELECT COUNT(*) AS value FROM usage_movement_events"
+                    ).fetchone()["value"],
+                }
+                parse_state_count = store.conn.execute(
+                    "SELECT COUNT(*) AS value FROM conversation_turn_parse_state"
+                ).fetchone()["value"]
+            finally:
+                store.close()
+
+            self.assertGreaterEqual(before_counts["conversation_turns"], 1)
+            self.assertGreaterEqual(before_counts["fits"], 1)
+            self.assertGreaterEqual(before_counts["model_effort_fits"], 1)
+            self.assertGreaterEqual(before_counts["model_effort_global_fits"], 1)
+            self.assertGreaterEqual(before_counts["movement_events"], 1)
+            self.assertGreaterEqual(parse_state_count, 1)
+
+            transcript_path.unlink()
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_first_reopen:
+                first_reopen = UsageStore(home)
+                try:
+                    first_counts = {
+                        "conversation_turns": first_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                        ).fetchone()["value"],
+                        "fits": first_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM fits"
+                        ).fetchone()["value"],
+                        "model_effort_fits": first_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM model_effort_fits"
+                        ).fetchone()["value"],
+                        "model_effort_global_fits": first_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM model_effort_global_fits"
+                        ).fetchone()["value"],
+                        "movement_events": first_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM usage_movement_events"
+                        ).fetchone()["value"],
+                    }
+                finally:
+                    first_reopen.close()
+
+            with mock.patch(
+                "codex_usage.store.parse_conversation_turns",
+                wraps=parse_conversation_turns_fn,
+            ) as parse_second_reopen:
+                second_reopen = UsageStore(home)
+                try:
+                    second_counts = {
+                        "conversation_turns": second_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM conversation_turns WHERE completed = 1"
+                        ).fetchone()["value"],
+                        "fits": second_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM fits"
+                        ).fetchone()["value"],
+                        "model_effort_fits": second_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM model_effort_fits"
+                        ).fetchone()["value"],
+                        "model_effort_global_fits": second_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM model_effort_global_fits"
+                        ).fetchone()["value"],
+                        "movement_events": second_reopen.conn.execute(
+                            "SELECT COUNT(*) AS value FROM usage_movement_events"
+                        ).fetchone()["value"],
+                    }
+                finally:
+                    second_reopen.close()
+
+            self.assertEqual(first_counts, before_counts)
+            self.assertEqual(second_counts, before_counts)
+            self.assertEqual(parse_first_reopen.call_count, 0)
+            self.assertEqual(parse_second_reopen.call_count, 0)
 
     def test_high_water_percent_movement_with_drop_is_not_overcounted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

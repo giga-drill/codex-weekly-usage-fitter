@@ -175,6 +175,16 @@ class UsageStore:
                 weekly_window_minutes INTEGER,
                 completed INTEGER NOT NULL DEFAULT 1
             );
+
+            CREATE TABLE IF NOT EXISTS conversation_turn_parse_state (
+                transcript_path TEXT PRIMARY KEY,
+                sample_count INTEGER NOT NULL,
+                sample_max_id INTEGER NOT NULL,
+                sample_max_observed_at TEXT,
+                transcript_mtime_ns INTEGER,
+                parsed_turn_count INTEGER NOT NULL,
+                checked_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("sessions", "reasoning_effort", "TEXT")
@@ -351,6 +361,132 @@ class UsageStore:
                 if prior_high is not None
                 else current_percent
             )
+        if self._has_missing_conversation_turn_rows():
+            return True
+        return False
+
+    def _has_missing_conversation_turn_rows(self) -> bool:
+        candidate_rows = list(
+            self.conn.execute(
+                """
+                SELECT
+                    s.transcript_path AS transcript_path,
+                    COUNT(*) AS sample_count,
+                    MAX(s.id) AS sample_max_id,
+                    MAX(s.observed_at) AS sample_max_observed_at,
+                    COALESCE(ct.turn_count, 0) AS conversation_turn_count
+                FROM samples s
+                LEFT JOIN (
+                    SELECT transcript_path, COUNT(*) AS turn_count
+                    FROM conversation_turns
+                    WHERE completed = 1
+                    GROUP BY transcript_path
+                ) ct
+                  ON ct.transcript_path = s.transcript_path
+                WHERE s.transcript_path IS NOT NULL
+                  AND s.transcript_path != ''
+                GROUP BY s.transcript_path
+                """
+            )
+        )
+        for row in candidate_rows:
+            transcript_path = str(row["transcript_path"])
+            sample_count = int(row["sample_count"] or 0)
+            sample_max_id = int(row["sample_max_id"] or 0)
+            sample_max_observed_at = row["sample_max_observed_at"]
+            conversation_turn_count = int(row["conversation_turn_count"] or 0)
+            transcript_mtime_ns = _safe_file_mtime_ns(transcript_path)
+            state = self.conn.execute(
+                """
+                SELECT
+                    sample_count,
+                    sample_max_id,
+                    sample_max_observed_at,
+                    transcript_mtime_ns,
+                    parsed_turn_count
+                FROM conversation_turn_parse_state
+                WHERE transcript_path = ?
+                """,
+                (transcript_path,),
+            ).fetchone()
+            if transcript_mtime_ns is None:
+                parsed_turn_count = (
+                    int(state["parsed_turn_count"] or 0)
+                    if state is not None
+                    else conversation_turn_count
+                )
+                if parsed_turn_count < conversation_turn_count:
+                    parsed_turn_count = conversation_turn_count
+                self._upsert_conversation_turn_parse_state_row(
+                    transcript_path=transcript_path,
+                    sample_count=sample_count,
+                    sample_max_id=sample_max_id,
+                    sample_max_observed_at=sample_max_observed_at,
+                    transcript_mtime_ns=None,
+                    parsed_turn_count=parsed_turn_count,
+                )
+                # Missing/unreadable transcripts are treated conservatively:
+                # preserve existing aggregates and skip stale detection.
+                continue
+
+            needs_parse = state is None
+            if state is not None:
+                if (
+                    int(state["sample_count"] or 0) != sample_count
+                    or int(state["sample_max_id"] or 0) != sample_max_id
+                    or state["sample_max_observed_at"] != sample_max_observed_at
+                    or _as_int_or_none(state["transcript_mtime_ns"]) != transcript_mtime_ns
+                ):
+                    needs_parse = True
+                elif int(state["parsed_turn_count"] or 0) != conversation_turn_count:
+                    return True
+            if not needs_parse:
+                continue
+
+            parsed_turns = parse_conversation_turns(transcript_path)
+            parsed_turn_count = len(parsed_turns)
+            if parsed_turn_count == 0 and conversation_turn_count > 0:
+                preserved_count = (
+                    int(state["parsed_turn_count"] or 0)
+                    if state is not None
+                    else conversation_turn_count
+                )
+                if preserved_count < conversation_turn_count:
+                    preserved_count = conversation_turn_count
+                self._upsert_conversation_turn_parse_state_row(
+                    transcript_path=transcript_path,
+                    sample_count=sample_count,
+                    sample_max_id=sample_max_id,
+                    sample_max_observed_at=sample_max_observed_at,
+                    transcript_mtime_ns=transcript_mtime_ns,
+                    parsed_turn_count=preserved_count,
+                )
+                continue
+            self._upsert_conversation_turn_parse_state_row(
+                transcript_path=transcript_path,
+                sample_count=sample_count,
+                sample_max_id=sample_max_id,
+                sample_max_observed_at=sample_max_observed_at,
+                transcript_mtime_ns=transcript_mtime_ns,
+                parsed_turn_count=parsed_turn_count,
+            )
+            if parsed_turn_count == 0:
+                continue
+            parsed_keys = {turn.conversation_turn_key for turn in parsed_turns}
+            stored_keys = {
+                item["conversation_turn_key"]
+                for item in self.conn.execute(
+                    """
+                    SELECT conversation_turn_key
+                    FROM conversation_turns
+                    WHERE completed = 1
+                      AND transcript_path = ?
+                    """,
+                    (transcript_path,),
+                )
+            }
+            if not parsed_keys.issubset(stored_keys) or parsed_turn_count != conversation_turn_count:
+                return True
         return False
 
     def record_sample(
@@ -818,9 +954,15 @@ class UsageStore:
             )
         ]
         parsed_turns: list[TranscriptConversationTurn] = []
+        parsed_turn_count_by_path: dict[str, int] = {}
         for transcript_path in transcript_paths:
-            parsed_turns.extend(parse_conversation_turns(transcript_path))
+            turns = parse_conversation_turns(transcript_path)
+            parsed_turn_count_by_path[str(transcript_path)] = len(turns)
+            parsed_turns.extend(turns)
         if not parsed_turns:
+            self._sync_conversation_turn_parse_state(
+                parsed_turn_count_by_path=parsed_turn_count_by_path
+            )
             return
 
         parsed_turns.sort(
@@ -933,6 +1075,109 @@ class UsageStore:
                     turn.weekly_window_minutes_end,
                 ),
             )
+        self._sync_conversation_turn_parse_state(
+            parsed_turn_count_by_path=parsed_turn_count_by_path
+        )
+
+    def _sync_conversation_turn_parse_state(
+        self,
+        *,
+        parsed_turn_count_by_path: dict[str, int] | None = None,
+    ) -> None:
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT
+                    transcript_path,
+                    COUNT(*) AS sample_count,
+                    MAX(id) AS sample_max_id,
+                    MAX(observed_at) AS sample_max_observed_at
+                FROM samples
+                WHERE transcript_path IS NOT NULL
+                  AND transcript_path != ''
+                GROUP BY transcript_path
+                """
+            )
+        )
+        for row in rows:
+            transcript_path = str(row["transcript_path"])
+            parsed_turn_count = (
+                int(parsed_turn_count_by_path[transcript_path])
+                if parsed_turn_count_by_path is not None
+                and transcript_path in parsed_turn_count_by_path
+                else int(
+                    self.conn.execute(
+                        """
+                        SELECT COUNT(*) AS value
+                        FROM conversation_turns
+                        WHERE completed = 1
+                          AND transcript_path = ?
+                        """,
+                        (transcript_path,),
+                    ).fetchone()["value"]
+                )
+            )
+            self._upsert_conversation_turn_parse_state_row(
+                transcript_path=transcript_path,
+                sample_count=int(row["sample_count"] or 0),
+                sample_max_id=int(row["sample_max_id"] or 0),
+                sample_max_observed_at=row["sample_max_observed_at"],
+                transcript_mtime_ns=_safe_file_mtime_ns(transcript_path),
+                parsed_turn_count=parsed_turn_count,
+            )
+        self.conn.execute(
+            """
+            DELETE FROM conversation_turn_parse_state
+            WHERE transcript_path NOT IN (
+                SELECT transcript_path
+                FROM samples
+                WHERE transcript_path IS NOT NULL
+                  AND transcript_path != ''
+                GROUP BY transcript_path
+            )
+            """
+        )
+
+    def _upsert_conversation_turn_parse_state_row(
+        self,
+        *,
+        transcript_path: str,
+        sample_count: int,
+        sample_max_id: int,
+        sample_max_observed_at: str | None,
+        transcript_mtime_ns: int | None,
+        parsed_turn_count: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO conversation_turn_parse_state (
+                transcript_path,
+                sample_count,
+                sample_max_id,
+                sample_max_observed_at,
+                transcript_mtime_ns,
+                parsed_turn_count,
+                checked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(transcript_path) DO UPDATE SET
+                sample_count = excluded.sample_count,
+                sample_max_id = excluded.sample_max_id,
+                sample_max_observed_at = excluded.sample_max_observed_at,
+                transcript_mtime_ns = excluded.transcript_mtime_ns,
+                parsed_turn_count = excluded.parsed_turn_count,
+                checked_at = excluded.checked_at
+            """,
+            (
+                transcript_path,
+                int(sample_count),
+                int(sample_max_id),
+                sample_max_observed_at,
+                transcript_mtime_ns,
+                int(parsed_turn_count),
+                utc_now_iso(),
+            ),
+        )
 
     def status(self) -> dict[str, Any]:
         latest_conversation_turn = self.conn.execute(
@@ -1361,6 +1606,22 @@ def _string_or_none(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_file_mtime_ns(path: str) -> int | None:
+    try:
+        return Path(path).expanduser().stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _normalize_effort(value: Any) -> str | None:
