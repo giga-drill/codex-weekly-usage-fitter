@@ -1,6 +1,6 @@
 # Codex Usage Handoff
 
-Last updated: 2026-05-09
+Last updated: 2026-05-18
 
 This is the short handoff entrypoint for planner and executor sessions.
 `AGENTS.md` stays tiny because Codex auto-loads it. Read this file first, then
@@ -36,9 +36,9 @@ Public repo: `https://github.com/giga-drill/codex-weekly-usage-fitter`
 
 ## Current Repo State
 
-- Branch: `main`, tracking `origin/main`, currently ahead by 1 commit.
-- Working tree is dirty. Do not revert current changes unless the user asks.
-- Current dirty files include README, widget, CLI/store/tests, and docs.
+- Current c-orch worktree is on detached HEAD at `f4abacf` (same commit as `main`).
+- `main` tracks `origin/main` and is currently ahead by 4 commits.
+- Working tree is clean.
 - The repo path contains a space: `/Users/mac/projs/codex usage`.
 
 ## Current Status
@@ -73,7 +73,7 @@ Latest validation state:
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Current result: 38 passing tests.
+Current result: 39 passing tests (revalidated on 2026-05-18).
 
 ## Active Notes
 
