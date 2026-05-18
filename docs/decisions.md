@@ -1,6 +1,6 @@
 # Codex Usage Decisions
 
-Last updated: 2026-05-08
+Last updated: 2026-05-18
 
 This file holds stable product and architecture decisions. It is not
 auto-loaded by Codex; read it when changing semantics or user-visible behavior.
@@ -148,3 +148,23 @@ process.
 - `docs/history.md` holds completed execution updates.
 - Completed detail should leave `docs.md` once it is captured in code, tests,
   README, decisions, or history.
+
+## Coverage Diagnostics Policy
+
+Coverage diagnostics is a local metadata audit for transcript-ingestion
+coverage. It is not a remote billing truth source.
+
+Rules:
+
+- Report two layers separately and do not merge them into one coverage number:
+  - raw observation layer (`sessions` / `samples`)
+  - completed aggregate layer (`conversation_turns WHERE completed = 1`)
+- Coverage counts are based on transcripts with `token_count` events.
+  `token_count` without `task_complete` is valid raw evidence but should not be
+  assumed to appear in completed conversation-turn aggregates.
+- Default CLI output can only print bounded recent missing examples with
+  metadata (session id, cwd, model, reasoning effort, timestamp, transcript
+  path). Do not print transcript message content.
+- JSON coverage fields are a stable contract for tests/integrations:
+  `all_history`, `recent_window`, and `recent_missing_examples` with explicit
+  layer-specific presence and missing counts.

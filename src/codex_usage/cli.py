@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .collector import UsageCollector, enqueue_stop_event, run_daemon_with_scan
+from .coverage_diagnostics import (
+    DEFAULT_MISSING_LIMIT,
+    DEFAULT_RECENT_WINDOW_HOURS,
+    build_coverage_diagnostics,
+)
 from .paths import usage_home
 from .store import UsageStore
 
@@ -29,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_backfill_transcripts(home, args)
     if args.command == "status":
         return _cmd_status(home, args)
+    if args.command == "coverage":
+        return _cmd_coverage(home, args)
     if args.command == "billing-stats":
         return _cmd_billing_stats(home, args)
     if args.command == "export":
@@ -94,6 +101,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show current weekly usage fit")
     status.add_argument("--json", action="store_true", help="print JSON")
+
+    coverage = sub.add_parser(
+        "coverage",
+        help="audit transcript coverage in raw and completed layers",
+    )
+    coverage.add_argument(
+        "--codex-home",
+        default=None,
+        help="override Codex home (default: ~/.codex)",
+    )
+    coverage.add_argument(
+        "--since-hours",
+        type=float,
+        default=DEFAULT_RECENT_WINDOW_HOURS,
+        help="recent coverage window in hours",
+    )
+    coverage.add_argument(
+        "--missing-limit",
+        type=int,
+        default=DEFAULT_MISSING_LIMIT,
+        help="max recent missing examples to print",
+    )
+    coverage.add_argument("--json", action="store_true", help="print JSON")
 
     billing = sub.add_parser(
         "billing-stats",
@@ -204,6 +234,25 @@ def _cmd_status(home: Path, args: argparse.Namespace) -> int:
         return 0
 
     print(_format_status(status))
+    return 0
+
+
+def _cmd_coverage(home: Path, args: argparse.Namespace) -> int:
+    codex_home = (
+        Path(args.codex_home).expanduser()
+        if args.codex_home
+        else (Path.home() / ".codex")
+    )
+    report = build_coverage_diagnostics(
+        home=home,
+        codex_home=codex_home,
+        since_hours=max(0.0, float(args.since_hours)),
+        missing_limit=max(0, int(args.missing_limit)),
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    print(_format_coverage(report))
     return 0
 
 
@@ -474,6 +523,64 @@ def _format_billing_stats(stats: dict[str, Any], debug: bool = False) -> str:
                     f"delta={_format_token_count(event['token_delta_total'])}  "
                     f"conversation_turns={event['turn_count']}{external_hint}"
                 )
+    return "\n".join(lines)
+
+
+def _format_coverage(report: dict[str, Any]) -> str:
+    coverage = report.get("coverage") or {}
+    all_history = coverage.get("all_history") or {}
+    recent = coverage.get("recent_window") or {}
+    examples = coverage.get("recent_missing_examples") or []
+
+    def _window_lines(label: str, window: dict[str, Any]) -> list[str]:
+        return [
+            f"{label}:",
+            "  "
+            f"transcripts={window.get('transcript_files_discovered_count', 0)} "
+            f"sessions={window.get('sessions_discovered_count', 0)} "
+            f"with_token_count={window.get('with_token_count_count', 0)} "
+            f"with_token_count_and_task_complete={window.get('with_token_count_and_task_complete_count', 0)}",
+            "  "
+            f"raw_layer: sessions={window.get('present_in_sessions_count', 0)} "
+            f"samples={window.get('present_in_samples_count', 0)} "
+            f"union={window.get('present_in_raw_observation_layer_count', 0)}",
+            "  "
+            "completed_conversation_turns="
+            f"{window.get('present_in_completed_conversation_turns_count', 0)} "
+            f"missing_from_sessions={window.get('missing_from_sessions_count', 0)} "
+            "missing_from_conversation_turns="
+            f"{window.get('missing_from_conversation_turns_count', 0)}",
+        ]
+
+    lines = [
+        "Transcript coverage audit",
+        f"Usage home: {report.get('home')}",
+        f"Codex home: {report.get('codex_home')}",
+        f"Recent window: last {report.get('recent_window_hours')} hour(s)",
+        f"Missing examples limit: {report.get('missing_limit')}",
+        "",
+    ]
+    lines.extend(_window_lines("All history", all_history))
+    lines.append("")
+    lines.extend(_window_lines("Recent window", recent))
+    lines.append("")
+    lines.append("Recent missing examples:")
+    if not examples:
+        lines.append("  (none)")
+        return "\n".join(lines)
+    for item in examples:
+        lines.append(
+            "  - "
+            f"session_id={item.get('session_id') or '-'} "
+            f"cwd={item.get('cwd') or '-'} "
+            f"model={item.get('model') or '-'} "
+            f"effort={item.get('reasoning_effort') or '-'} "
+            f"last_timestamp={item.get('last_timestamp') or '-'} "
+            f"missing_from_sessions={bool(item.get('missing_from_sessions'))} "
+            "missing_from_conversation_turns="
+            f"{bool(item.get('missing_from_conversation_turns'))} "
+            f"path={item.get('transcript_path') or '-'}"
+        )
     return "\n".join(lines)
 
 

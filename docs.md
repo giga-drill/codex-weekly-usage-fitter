@@ -67,13 +67,23 @@ Conversation-turn migration blockers from planner review are now fixed:
 CLI status raw row is now clearly labeled as internal:
 `Latest raw sample (internal) ...`.
 
+Coverage diagnostics is now first-class in CLI:
+
+- new command `codex-usage coverage` audits local transcript coverage against
+  raw observation (`sessions`/`samples`) and completed aggregate
+  (`conversation_turns`) layers separately;
+- reports both `all_history` and `recent_window` (default 48 hours, adjustable
+  via `--since-hours`);
+- includes bounded recent missing examples with metadata only (no transcript
+  content), and stable JSON fields for automation/tests.
+
 Latest validation state:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Current result: 50 passing tests (revalidated on 2026-05-18).
+Current result: 54 passing tests (revalidated on 2026-05-18).
 
 Latest fix notes (2026-05-18):
 
@@ -89,6 +99,9 @@ Latest fix notes (2026-05-18):
 - missing/unreadable transcripts now keep existing aggregates conservatively:
   reopen no longer reparses or downgrades parse-state to zero in ways that can
   trigger destructive stale rebuilds on otherwise stable databases.
+- coverage diagnostics DB presence loading is now query-scoped fault tolerant:
+  missing legacy `conversation_turns` tables no longer erase successful
+  `sessions`/`samples` coverage detection.
 
 ## Active Notes
 
@@ -138,6 +151,8 @@ Use these from `/Users/mac/projs/codex usage`:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m codex_usage status
+PYTHONPATH=src python3 -m codex_usage coverage
+PYTHONPATH=src python3 -m codex_usage coverage --since-hours 72 --missing-limit 20 --json
 PYTHONPATH=src python3 -m codex_usage scan-transcripts --since-hours 48
 PYTHONPATH=src python3 -m codex_usage backfill-transcripts
 PYTHONPATH=src python3 -m codex_usage backfill-transcripts --with-app-server

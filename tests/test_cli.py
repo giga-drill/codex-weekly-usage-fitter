@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import shlex
 import unittest
 from contextlib import redirect_stdout
@@ -9,6 +11,7 @@ from unittest import mock
 
 from codex_usage.cli import _default_hook_command, _toml_string, main
 from codex_usage.collector import TranscriptScanStats
+from codex_usage.store import UsageStore
 
 
 class CliTests(unittest.TestCase):
@@ -88,6 +91,156 @@ class CliTests(unittest.TestCase):
             delay_seconds=0,
             use_app_server=True,
         )
+
+    def test_coverage_command_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "usage"
+            codex_home = root / "codex"
+            session_dir = codex_home / "sessions" / "2026" / "05" / "18"
+            session_dir.mkdir(parents=True)
+
+            rollout_path = session_dir / "rollout-cli-coverage.jsonl"
+            rollout_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:00Z",
+                                "type": "session_meta",
+                                "payload": {"id": "cli-session", "cwd": "/tmp/cli"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:01Z",
+                                "type": "turn_context",
+                                "payload": {
+                                    "turn_id": "cli-turn",
+                                    "model": "gpt-cli",
+                                    "effort": "high",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:02Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {"total_tokens": 123}
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            store = UsageStore(home)
+            store.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "--home",
+                        str(home),
+                        "coverage",
+                        "--codex-home",
+                        str(codex_home),
+                        "--since-hours",
+                        "72",
+                        "--missing-limit",
+                        "1",
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertIn("coverage", payload)
+            self.assertIn("all_history", payload["coverage"])
+            self.assertIn("recent_window", payload["coverage"])
+            self.assertEqual(payload["recent_window_hours"], 72.0)
+            self.assertEqual(payload["missing_limit"], 1)
+
+    def test_coverage_command_text_output_shows_missing_examples_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "usage"
+            codex_home = root / "codex"
+            session_dir = codex_home / "sessions" / "2026" / "05" / "18"
+            session_dir.mkdir(parents=True)
+
+            rollout_path = session_dir / "rollout-cli-coverage-text.jsonl"
+            rollout_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:00Z",
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "cli-session-text",
+                                    "cwd": "/tmp/cli-text",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:01Z",
+                                "type": "turn_context",
+                                "payload": {
+                                    "turn_id": "cli-turn-text",
+                                    "model": "gpt-cli",
+                                    "effort": "medium",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-18T01:00:02Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {"total_tokens": 456}
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            store = UsageStore(home)
+            store.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "--home",
+                        str(home),
+                        "coverage",
+                        "--codex-home",
+                        str(codex_home),
+                        "--missing-limit",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            text = output.getvalue()
+            self.assertIn("Transcript coverage audit", text)
+            self.assertIn("Recent missing examples:", text)
+            self.assertIn("session_id=cli-session-text", text)
 
 
 if __name__ == "__main__":
