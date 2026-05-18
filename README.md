@@ -125,6 +125,7 @@ PYTHONPATH=src python3 -m codex_usage status
 PYTHONPATH=src python3 -m codex_usage daemon
 PYTHONPATH=src python3 -m codex_usage export
 PYTHONPATH=src python3 -m codex_usage hook-config
+PYTHONPATH=src python3 -m codex_usage backfill-transcripts
 ```
 
 Run after `pip install -e .`:
@@ -134,7 +135,15 @@ codex-usage status
 codex-usage daemon
 codex-usage export
 codex-usage hook-config
+codex-usage backfill-transcripts
 ```
+
+`daemon` and `scan-transcripts` only scan recent transcript files (48 hours by
+default) so periodic collection stays bounded. Use `backfill-transcripts` as an
+explicit one-shot command when you want a full-history local transcript import.
+By default, backfill only uses weekly snapshots already present in transcript
+events. It does not read current app-server weekly fallback values unless you
+explicitly pass `--with-app-server`.
 
 ## Data Collected
 
@@ -144,10 +153,15 @@ The SQLite database contains:
   Codex session.
 - `samples`: per-turn hook samples, including token deltas, model, reasoning
   effort, weekly usage, and parse errors if any.
+- `conversation_turns`: completed conversation-turn aggregates rebuilt from
+  transcript/user-message boundaries.
 - `epochs`: weekly reset windows.
 - `fits`: token-per-weekly-percent estimates for the current weekly window.
 - `model_effort_fits`: token-per-weekly-percent and turn-per-weekly-percent
   estimates grouped by model and reasoning effort.
+
+`samples` is the raw observation layer. `conversation_turns` is the user-facing
+aggregate layer used by movement/fits/billing-style summaries.
 
 The first observed sample for a session is treated as a baseline and records
 `token_delta = 0`, so enabling the tool in the middle of a long session does not
@@ -162,6 +176,14 @@ Only local Codex sessions on this machine can contribute token deltas. If your
 weekly usage changes because of Codex Web, another machine, or a session that
 was not covered by the hook, the monitor can see the weekly percentage move but
 cannot fully attribute the token usage.
+
+Transcript backfill reads local transcript files only. This tool does not
+upload transcript content.
+
+If you run `backfill-transcripts --with-app-server`, historical rows without
+embedded `rate_limits` may pick up the app-server's current weekly view instead
+of transcript-native snapshots. Use that mode only when you accept this
+tradeoff.
 
 The token-to-usage fit is an estimate. It becomes more useful after enough local
 turns have been observed, especially after the weekly percentage has visibly

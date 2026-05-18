@@ -26,6 +26,13 @@ class TranscriptTurn:
     reasoning_effort: str | None = None
 
 
+@dataclass(frozen=True)
+class TranscriptScanStats:
+    files_considered: int = 0
+    turns_considered: int = 0
+    samples_inserted: int = 0
+
+
 class UsageCollector:
     def __init__(
         self,
@@ -89,20 +96,30 @@ class UsageCollector:
                 continue
         return count
 
-    def scan_recent_transcripts(self, *, since_seconds: float = 48 * 3600) -> int:
+    def scan_transcripts(
+        self,
+        *,
+        since_seconds: float | None = 48 * 3600,
+        rebuild_per_insert: bool = True,
+    ) -> TranscriptScanStats:
         sessions_dir = self.codex_home / "sessions"
         if not sessions_dir.exists():
-            return 0
+            return TranscriptScanStats()
 
-        cutoff = time.time() - since_seconds
-        count = 0
-        candidates = [
-            path
-            for path in sessions_dir.rglob("rollout-*.jsonl")
-            if _safe_mtime(path) >= cutoff
-        ]
+        cutoff = None if since_seconds is None else time.time() - since_seconds
+        candidates = list(sessions_dir.rglob("rollout-*.jsonl"))
+        if cutoff is not None:
+            candidates = [
+                path for path in candidates if _safe_mtime(path) >= float(cutoff)
+            ]
+
+        files_considered = 0
+        turns_considered = 0
+        samples_inserted = 0
         for path in sorted(candidates, key=lambda item: (_safe_mtime(item), str(item))):
+            files_considered += 1
             for turn in _transcript_turns(path):
+                turns_considered += 1
                 event = {
                     "session_id": turn.session_id,
                     "turn_id": turn.turn_id,
@@ -113,11 +130,20 @@ class UsageCollector:
                     "received_at": utc_now_iso(),
                     "source": "transcript_scan",
                 }
-                if self._record_event(event):
-                    count += 1
-        return count
+                if self._record_event(event, rebuild=rebuild_per_insert):
+                    samples_inserted += 1
+        if samples_inserted > 0 and not rebuild_per_insert:
+            self.store.rebuild_epochs_and_fits()
+        return TranscriptScanStats(
+            files_considered=files_considered,
+            turns_considered=turns_considered,
+            samples_inserted=samples_inserted,
+        )
 
-    def _record_event(self, event: dict[str, Any]) -> bool:
+    def scan_recent_transcripts(self, *, since_seconds: float = 48 * 3600) -> int:
+        return self.scan_transcripts(since_seconds=since_seconds).samples_inserted
+
+    def _record_event(self, event: dict[str, Any], *, rebuild: bool = True) -> bool:
         transcript_path = event.get("transcript_path")
         if not transcript_path:
             return False
@@ -134,7 +160,9 @@ class UsageCollector:
         if snapshot.weekly_limit is None and self.use_app_server:
             fallback_weekly = self.app_server.read_weekly_limit()
 
-        return self.store.record_sample(event, snapshot, fallback_weekly)
+        return self.store.record_sample(
+            event, snapshot, fallback_weekly, rebuild=rebuild
+        )
 
 
 class _UsageRequestHandler(socketserver.StreamRequestHandler):

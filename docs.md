@@ -73,7 +73,7 @@ Latest validation state:
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-Current result: 39 passing tests (revalidated on 2026-05-18).
+Current result: 46 passing tests (revalidated on 2026-05-18).
 
 ## Active Notes
 
@@ -93,6 +93,17 @@ Hook runtime note:
   so forked/planner sessions are recorded even when hooks do not fire.
 - Hook config remains installed as a fast path; `scripts/codex-usage-hook.sh`
   logs successful invocations when Codex starts honoring hooks again.
+- Recent fallback scanning remains bounded by a time window (default 48 hours).
+  Full-history transcript import is now an explicit one-shot CLI command:
+  `backfill-transcripts`.
+- Backfill defaults to transcript-only weekly snapshots (`use_app_server=False`)
+  to keep historical imports deterministic when old files lack `rate_limits`.
+  `--with-app-server` is opt-in and should be used only when that fallback
+  tradeoff is acceptable.
+- Sample insertion now also deduplicates by stable transcript observation keys
+  (`session_id`, `turn_id`, `transcript_path`, `observed_at`, `token_total`) so
+  a fallback-assisted recent scan and a transcript-only backfill will not
+  double-insert the same transcript token event.
 
 Product semantics to preserve:
 
@@ -112,6 +123,9 @@ Use these from `/Users/mac/projs/codex usage`:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m codex_usage status
+PYTHONPATH=src python3 -m codex_usage scan-transcripts --since-hours 48
+PYTHONPATH=src python3 -m codex_usage backfill-transcripts
+PYTHONPATH=src python3 -m codex_usage backfill-transcripts --with-app-server
 PYTHONPATH=src python3 -m codex_usage billing-stats --billing-day 12 --period current --debug
 PYTHONPATH=src python3 -m codex_usage billing-stats --billing-day 12 --period previous --json
 scripts/package-widget-app.sh

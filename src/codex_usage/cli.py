@@ -25,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_daemon(home, args)
     if args.command == "scan-transcripts":
         return _cmd_scan_transcripts(home, args)
+    if args.command == "backfill-transcripts":
+        return _cmd_backfill_transcripts(home, args)
     if args.command == "status":
         return _cmd_status(home, args)
     if args.command == "billing-stats":
@@ -70,6 +72,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-app-server",
         action="store_true",
         help="disable account/rateLimits/read fallback",
+    )
+
+    backfill = sub.add_parser(
+        "backfill-transcripts",
+        help="explicitly backfill all local Codex transcripts across full history",
+    )
+    backfill.add_argument(
+        "--with-app-server",
+        action="store_true",
+        help="allow app-server weekly fallback for transcripts missing rate_limits",
     )
 
     sample = sub.add_parser("sample-stop", help="enqueue a Codex Stop hook event")
@@ -156,6 +168,27 @@ def _cmd_scan_transcripts(home: Path, args: argparse.Namespace) -> int:
     finally:
         collector.close()
     print(f"Inserted {inserted} transcript sample(s).")
+    return 0
+
+
+def _cmd_backfill_transcripts(home: Path, args: argparse.Namespace) -> int:
+    collector = UsageCollector(
+        home,
+        delay_seconds=0,
+        use_app_server=bool(args.with_app_server),
+    )
+    try:
+        stats = collector.scan_transcripts(
+            since_seconds=None, rebuild_per_insert=False
+        )
+    finally:
+        collector.close()
+    print(
+        "Considered "
+        f"{stats.files_considered} transcript file(s), "
+        f"{stats.turns_considered} transcript turn(s). "
+        f"Inserted {stats.samples_inserted} transcript sample(s)."
+    )
     return 0
 
 

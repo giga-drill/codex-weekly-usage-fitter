@@ -358,6 +358,8 @@ class UsageStore:
         event: dict[str, Any],
         snapshot: TranscriptSnapshot,
         fallback_weekly: WeeklyLimit | None = None,
+        *,
+        rebuild: bool = True,
     ) -> bool:
         observed_at = _sample_observed_at(event, snapshot)
         session_id = _string_or_none(event.get("session_id"))
@@ -385,6 +387,14 @@ class UsageStore:
             token_total=token_total,
             weekly=weekly,
         )
+        if self._has_matching_sample(
+            session_id=session_id,
+            turn_id=turn_id,
+            transcript_path=transcript_path,
+            observed_at=observed_at,
+            token_total=token_total,
+        ):
+            return False
 
         row = {
             "event_id": event_id,
@@ -453,9 +463,33 @@ class UsageStore:
                     reasoning_effort=reasoning_effort,
                 )
 
-        if inserted:
+        if inserted and rebuild:
             self.rebuild_epochs_and_fits()
         return inserted
+
+    def _has_matching_sample(
+        self,
+        *,
+        session_id: str | None,
+        turn_id: str | None,
+        transcript_path: str | None,
+        observed_at: str,
+        token_total: int | None,
+    ) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM samples
+            WHERE session_id IS ?
+              AND turn_id IS ?
+              AND transcript_path IS ?
+              AND observed_at = ?
+              AND token_total IS ?
+            LIMIT 1
+            """,
+            (session_id, turn_id, transcript_path, observed_at, token_total),
+        ).fetchone()
+        return row is not None
 
     def _session_total(self, session_id: str | None) -> int | None:
         if not session_id:
